@@ -402,6 +402,43 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
         controller = AdaptiveController()
         print("adaptive controller ON (spike-guard + plateau rescue + online LR)", flush=True)
 
+    # Periodic held-out eval (idea 4a) - see train_stage2_pod.py for the rationale. Mirrored
+    # here so the Modal entry point behaves identically. Switching arms only (all share
+    # PackedRoutedStream); plain content CE on a held-out seed, distinct from training.
+    from src.model.stage2_config import EVAL_EVERY, VAL_BATCHES, VAL_SEED
+    from src.model.stage2_config import ROUTED3_MAX_DOMAINS, ROUTED3_MIN_DOMAINS, ROUTED3_SNIPPET_WORDS
+
+    val_iter = None
+    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed3"):
+        rs3 = arm == "routed3"
+        val_iter = iter(DataLoader(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"], seed=VAL_SEED,
+            min_domains=ROUTED3_MIN_DOMAINS if rs3 else 2,
+            max_domains=ROUTED3_MAX_DOMAINS if rs3 else 4,
+            snippet_words=ROUTED3_SNIPPET_WORDS if rs3 else 250,
+        ), batch_size=BATCH_SIZE))
+
+    def _held_out_ce():
+        model.eval()
+        tot_nats, tot_tok = 0.0, 0
+        with torch.no_grad():
+            for _ in range(VAL_BATCHES):
+                tok, dom, ctrl, typ, tgt = next(val_iter)
+                tok, dom, ctrl, typ, tgt = (t.to(device) for t in (tok, dom, ctrl, typ, tgt))
+                with torch.autocast("cuda"):
+                    out = model(tok, dom, ctrl, targets=None, type_ids=typ)
+                for d in model.domains:
+                    if d not in out:
+                        continue
+                    mask, logits = out[d]
+                    dt = tgt[mask]
+                    keep = dt < bundle.domain_vocab_sizes[d]
+                    if keep.any():
+                        tot_nats += F.cross_entropy(logits[keep], dt[keep], reduction="sum").item()
+                        tot_tok += int(keep.sum().item())
+        model.train()
+        return tot_nats / max(tot_tok, 1)
+
     t0 = time.time()
     running, running_n = 0.0, 0
     history = []
@@ -489,6 +526,11 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
 
         if controller is not None:
             controller.observe(controller_loss_val)  # plateau/online LR from MAIN loss
+
+        if val_iter is not None and (step % EVAL_EVERY == 0 or step == total_steps):
+            val_ce = _held_out_ce()
+            history.append({"step": step, "val_ce": round(val_ce, 4), "elapsed": round(time.time() - t0)})
+            print(f"  >>> held-out val CE @ step {step}: {val_ce:.4f} (over {VAL_BATCHES} val batches)", flush=True)
 
         if step % LOG_EVERY == 0:
             avg = running / max(running_n, 1)

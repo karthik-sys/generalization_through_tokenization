@@ -35,6 +35,17 @@ MAX_STEPS = 20000  # tune against your free-tier GPU's time budget (Colab T4: ~a
 CHECKPOINT_EVERY = 1000
 LOG_EVERY = 50
 
+# Periodic held-out eval during training (idea 4a): every EVAL_EVERY steps, compute plain
+# cross-entropy on VAL_BATCHES batches drawn from a held-out val stream (a distinct seed /
+# skip offset from training), so we watch a *generalization* trajectory alongside the
+# training-loss trajectory rather than only seeing held-out numbers after the run. Catches
+# overfitting/plateau live and tells us the real "when to stop". Logged into `history` so it
+# rides along in checkpoints and the dashboard. Lightweight plain-CE, not the full BPB/LAMBADA
+# suite (those need byte-accounting / an external dataset and belong in the post-hoc eval).
+EVAL_EVERY = 10000
+VAL_BATCHES = 20
+VAL_SEED = 9999  # held-out: distinct from training's seed=0 so synthetic composition differs
+
 # MoTRoutedModel only. Measured on the real corpus (src/train_routed.py): switches are
 # ~1-in-461 positions - unweighted cross-entropy left switch_accuracy at 0.000 across 4
 # full CPU epochs. 50x upweighting fixed it (0.000 -> 0.34 at epoch 1, settling ~0.23-0.27).
