@@ -23,6 +23,14 @@ SOTA_ENCODING = "cl100k_base"  # unchanged from stage 1 - already a real 100,277
 MODEL_CFG = dict(emb_dim=128, d_model=512, n_heads=8, ffn_dim=2048, n_layers=6, max_seq_len=1024)
 BACKBONE_ONLY_CFG = {k: v for k, v in MODEL_CFG.items() if k != "emb_dim"}
 
+# Scale test (arms "motlarge" / "baselinelarge"): ~3-4x the backbone to probe THE open
+# question - does MoT's advantage over unified-BPE survive a real parameter increase, or is
+# it a small-scale artifact? d_model 512->768, layers 6->12, heads 8->12, ffn 2048->3072,
+# emb_dim 128->192; max_seq_len held at 1024 so the data pipeline is unchanged. Only a MATCHED
+# pair is informative (scaling just the winner tells you nothing), so both arms use this.
+LARGE_MODEL_CFG = dict(emb_dim=192, d_model=768, n_heads=12, ffn_dim=3072, n_layers=12, max_seq_len=1024)
+LARGE_BACKBONE_ONLY_CFG = {k: v for k, v in LARGE_MODEL_CFG.items() if k != "emb_dim"}
+
 # BATCH_SIZE 16 OOM'd a real T4 (14.56GiB) during calibration - the logits tensor alone
 # is batch*seq*vocab*4 bytes, which at batch 16 / seq 1024 is 2.4GB for nlp's 36k vocab
 # and 6.6GB for cl100k_base's 100k vocab. Batch 4 keeps the largest arm's logits under

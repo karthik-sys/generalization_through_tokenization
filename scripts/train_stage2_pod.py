@@ -70,7 +70,17 @@ def _hybrid_batch(step: int, domains: list[str], domain_index: dict[str, int],
     return (t.to(device) for t in (tok, dom, ctrl, typ, tgt))
 
 
-def _build_model(arm: str, bundle: TokenizerBundle, device: str):
+def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "base"):
+    # scale="large" (arms mot/baseline only, for the scale test) swaps the whole config for
+    # LARGE_MODEL_CFG - ~3-4x params. Everything else about the run is identical, which is the
+    # point: an apples-to-apples "does the advantage survive scale" pair.
+    if scale == "large":
+        from src.model.stage2_config import LARGE_BACKBONE_ONLY_CFG, LARGE_MODEL_CFG
+        if arm == "mot":
+            return MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LARGE_MODEL_CFG).to(device)
+        if arm == "baseline":
+            return BaselineModel(vocab_size=bundle.baseline_vocab_size, **LARGE_BACKBONE_ONLY_CFG).to(device)
+        raise ValueError(f"scale=large only supports mot/baseline, not {arm}")
     if arm == "mot":
         return MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     if arm == "routed":
@@ -92,14 +102,14 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str):
     return BaselineModel(vocab_size=bundle.sota_vocab_size, **BACKBONE_ONLY_CFG).to(device)
 
 
-def calibrate(arm: str, steps: int) -> float:
+def calibrate(arm: str, steps: int, scale: str = "base") -> float:
     device = "cuda"
     print(f"CUDA available: {torch.cuda.is_available()}  device: {torch.cuda.get_device_name(0)}", flush=True)
 
     bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
-    model = _build_model(arm, bundle, device)
-    print(f"{arm} params: {model.num_params():,}", flush=True)
+    model = _build_model(arm, bundle, device, scale)
+    print(f"{arm} ({scale}) params: {model.num_params():,}", flush=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
@@ -172,7 +182,7 @@ def calibrate(arm: str, steps: int) -> float:
     return sec_per_step
 
 
-def train(arm: str, max_steps: int | None = None) -> list:
+def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     device = "cuda"
     total_steps = max_steps or MAX_STEPS
     print(f"device: {torch.cuda.get_device_name(0)}  arm: {arm}  steps: {total_steps}", flush=True)
@@ -180,18 +190,19 @@ def train(arm: str, max_steps: int | None = None) -> list:
 
     bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
-    model = _build_model(arm, bundle, device)
-    print(f"{arm} params: {model.num_params():,}", flush=True)
+    model = _build_model(arm, bundle, device, scale)
+    print(f"{arm} ({scale}) params: {model.num_params():,}", flush=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=LR)
     scaler = torch.amp.GradScaler("cuda")
 
     CKPT_DIR.mkdir(exist_ok=True)
+    ckpt_prefix = f"large_{arm}" if scale == "large" else arm  # keep large runs off base names
 
     def _latest_checkpoint() -> str | None:
         import glob
         import re
-        paths = glob.glob(str(CKPT_DIR / f"{arm}_step*.pt"))
+        paths = glob.glob(str(CKPT_DIR / f"{ckpt_prefix}_step*.pt"))
         return sorted(paths, key=lambda p: int(re.search(r"step(\d+)", p).group(1)), reverse=True)
 
     start_step = 1
@@ -363,7 +374,7 @@ def train(arm: str, max_steps: int | None = None) -> list:
             running, running_n = 0.0, 0
 
         if step % CHECKPOINT_EVERY == 0 or step == total_steps:
-            path = CKPT_DIR / f"{arm}_step{step}.pt"
+            path = CKPT_DIR / f"{ckpt_prefix}_step{step}.pt"
             torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
                         "domain_vocab_sizes": bundle.domain_vocab_sizes, "history": history}, path)
             print(f"checkpoint saved: {path}", flush=True)
@@ -382,11 +393,13 @@ if __name__ == "__main__":
                          choices=["mot", "baseline", "sota", "routed", "pooled", "hybrid", "pooled2",
                                   "routed2", "routed3"])
     parser.add_argument("--steps", type=int, default=0)
+    parser.add_argument("--scale", choices=["base", "large"], default="base",
+                         help="'large' (mot/baseline only) uses LARGE_MODEL_CFG for the scale test")
     args = parser.parse_args()
 
     if args.mode == "calibrate":
-        sec_per_step = calibrate(args.arm, args.steps or 150)
+        sec_per_step = calibrate(args.arm, args.steps or 150, scale=args.scale)
         print(f"\n--- extrapolation ---")
         print(f"{sec_per_step:.3f} sec/step x {MAX_STEPS} steps = {sec_per_step*MAX_STEPS/3600:.2f} GPU-hours (config MAX_STEPS)")
     else:
-        train(args.arm, max_steps=args.steps or None)
+        train(args.arm, max_steps=args.steps or None, scale=args.scale)
