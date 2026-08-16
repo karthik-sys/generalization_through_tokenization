@@ -80,7 +80,11 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
             return MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LARGE_MODEL_CFG).to(device)
         if arm == "baseline":
             return BaselineModel(vocab_size=bundle.baseline_vocab_size, **LARGE_BACKBONE_ONLY_CFG).to(device)
-        raise ValueError(f"scale=large only supports mot/baseline, not {arm}")
+        if arm == "routed":
+            return MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LARGE_MODEL_CFG).to(device)
+        if arm == "routed3":  # routed + GradNorm loss + densest cross-domain data (best direction so far)
+            return MoTHybridModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LARGE_MODEL_CFG).to(device)
+        raise ValueError(f"scale=large supports mot/baseline/routed/routed3, not {arm}")
     if arm == "mot":
         return MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     if arm == "routed":

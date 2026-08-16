@@ -29,14 +29,24 @@ checkpoints as `large_mot_step*.pt` / `large_baseline_step*.pt` so they never co
 the base-size runs. Everything else about the training path is byte-identical to the normal
 mot/baseline runs.
 
+`--scale large` supports **mot, baseline, routed, routed3** (all ~190M except baseline's
+160M; all ~0.77 s/step / ~32 GPU-hr / 150k except baseline's 0.54 / ~22).
+
 ```bash
 cd /workspace/repo && git pull origin main
+```
 
-# pod A
-nohup python3 scripts/train_stage2_pod.py train --arm mot --steps 150000 --scale large > train.log 2>&1 &
+**Pick a pairing (every option needs baseline-large as the unified-vocab control):**
 
-# pod B
-nohup python3 scripts/train_stage2_pod.py train --arm baseline --steps 150000 --scale large > train.log 2>&1 &
+```bash
+# RECOMMENDED — does the CHAMPION's edge over unified-BPE survive scale?
+nohup python3 scripts/train_stage2_pod.py train --arm routed   --steps 150000 --scale large > train.log 2>&1 &   # pod A
+nohup python3 scripts/train_stage2_pod.py train --arm baseline --steps 150000 --scale large > train.log 2>&1 &   # pod B
+
+# ALT — purest minimal-MoT thesis test (mot is the simplest disjoint-table arm)
+#   --arm mot --scale large   +   --arm baseline --scale large
+
+# If a 3rd pod frees up, run all three (routed + mot + baseline large) for the full picture.
 ```
 
 (Optional sanity first: `python3 scripts/train_stage2_pod.py calibrate --arm mot --steps 30 --scale large` — should print `mot (large) params: 190,481,644` and a per-step time.)
