@@ -582,7 +582,9 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
 
     from src.data.build_examples import TokenizerBundle
     from src.model.baseline_model import BaselineModel
+    from src.model.mot_hybrid_model import MoTHybridModel
     from src.model.mot_model import MoTModel
+    from src.model.mot_pooled2_model import MoTPooled2Model
     from src.model.mot_pooled_model import MoTPooledModel
     from src.model.mot_routed_model import MoTRoutedModel
     from src.model.stage2_config import (
@@ -764,6 +766,11 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     elif arm == "pooled":
         model = MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
                                focal_gamma=FOCAL_GAMMA, confidence_weight=CONFIDENCE_WEIGHT).to(device)
+    elif arm in ("hybrid", "routed2", "routed3"):
+        model = MoTHybridModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "pooled2":
+        model = MoTPooled2Model(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
+                                focal_gamma=FOCAL_GAMMA).to(device)
     elif arm == "baseline":
         model = BaselineModel(vocab_size=bundle.baseline_vocab_size, **BACKBONE_ONLY_CFG).to(device)
     else:
