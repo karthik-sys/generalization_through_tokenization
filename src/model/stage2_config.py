@@ -107,7 +107,17 @@ ARM_LABELS = {
     "sota": "SOTA tokenizer (cl100k_base, 100k vocab)",
     "routed": "MoT + mid-sequence routing (predicts domain switches)",
     "pooled": "MoT + routing + PMA/DANN + fitting-loss (focal, per-domain-norm, confidence)",
+    "hybrid": "MoT-Routed-Adaptive hybrid (GradNorm switch loss + blended natural/synthetic data)",
+    "pooled2": "Pooled v2 (GradNorm loss, sparse top-2/16 routing, 256-chunk PMA, no confidence head)",
 }
+
+# arm="hybrid" only: fraction of training steps drawing a natural single-domain batch
+# (PackedDomainStream, long continuous context - what MoT trains on exclusively) rather than
+# a synthetic multi-domain switching batch (PackedRoutedStream). Addresses tax #2 in
+# mot_hybrid_model.py's docstring: plain MoTRoutedModel never sees natural single-domain
+# text, which is a plausible reason its raw content-modelling trails MoT even before
+# accounting for the switch-prediction burden.
+HYBRID_NATURAL_DATA_FRACTION = 0.6
 DOMAIN_TAG = {
     "code": "<domain:code>",
     "math": "<domain:math>",

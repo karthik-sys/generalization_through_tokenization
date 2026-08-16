@@ -104,9 +104,11 @@ class ExpertRouter(nn.Module):
     that domain identity is the interesting structure, which is the hypothesis under test.
     """
 
-    def __init__(self, d_model: int, n_experts: int = 16, n_active: int = 8, dormant_bias: float = -20.0):
+    def __init__(self, d_model: int, n_experts: int = 16, n_active: int = 8, dormant_bias: float = -20.0,
+                 top_k: int | None = None):
         super().__init__()
         self.n_experts = n_experts
+        self.top_k = top_k
         self.gate = nn.Linear(d_model, n_experts, bias=False)
         bias = torch.zeros(n_experts)
         bias[n_active:] = dormant_bias
@@ -121,14 +123,32 @@ class ExpertRouter(nn.Module):
 
         The auxiliary load-balancing loss is the standard Switch-Transformer form: without
         it a softmax router reliably collapses onto one or two experts and the rest never
-        receive gradient, which would defeat the point of having a bank at all.
+        receive gradient, which would defeat the point of having a bank at all. Computed from
+        the full softmax distribution even in top_k mode, since load-balancing needs to see
+        where probability mass WOULD go, not just which experts got dispatched.
         """
-        probs = F.softmax(self.gate(summary) + self.expert_bias, dim=-1)  # (b, n_experts)
-        stacked = torch.stack([e(summary) for e in self.experts], dim=1)  # (b, n_experts, d)
-        routed = (probs.unsqueeze(-1) * stacked).sum(dim=1)
-
-        mean_prob = probs.mean(dim=0)
+        full_probs = F.softmax(self.gate(summary) + self.expert_bias, dim=-1)  # (b, n_experts)
+        mean_prob = full_probs.mean(dim=0)
         load_balance = self.n_experts * (mean_prob * mean_prob).sum()
+
+        if self.top_k is None or self.top_k >= self.n_experts:
+            stacked = torch.stack([e(summary) for e in self.experts], dim=1)  # (b, n_experts, d)
+            routed = (full_probs.unsqueeze(-1) * stacked).sum(dim=1)
+            return routed, load_balance
+
+        # Sparse dispatch: only the experts actually selected per example get a forward pass,
+        # not all n_experts - the point of top_k routing. At our batch sizes (4) a python loop
+        # over the k slots, grouping by which unique expert got selected, is simple and correct;
+        # a real production MoE would use a batched scatter/gather kernel instead.
+        topk_vals, topk_idx = full_probs.topk(self.top_k, dim=-1)  # (b, top_k)
+        topk_weights = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
+        routed = torch.zeros_like(summary)
+        for slot in range(self.top_k):
+            expert_per_example = topk_idx[:, slot]  # (b,)
+            weight_per_example = topk_weights[:, slot].unsqueeze(-1)  # (b, 1)
+            for e_id in expert_per_example.unique().tolist():
+                sel = expert_per_example == e_id
+                routed[sel] = routed[sel] + weight_per_example[sel] * self.experts[e_id](summary[sel])
         return routed, load_balance
 
 
@@ -166,11 +186,12 @@ class SharedPoolingModule(nn.Module):
         n_active: int = 8,
         chunk_size: int = 128,
         n_heads: int = 8,
+        top_k: int | None = None,
     ):
         super().__init__()
         self.chunk_size = chunk_size
         self.pma = PMAPooling(d_model, n_seeds=n_seeds, n_heads=n_heads)
-        self.router = ExpertRouter(d_model, n_experts=n_experts, n_active=n_active)
+        self.router = ExpertRouter(d_model, n_experts=n_experts, n_active=n_active, top_k=top_k)
         self.discriminator = DomainDiscriminator(d_model, num_domains)
         # chunk 0 has no history to pool from - a learned null summary rather than zeros,
         # so "no context yet" is itself a representation the backbone can condition on.

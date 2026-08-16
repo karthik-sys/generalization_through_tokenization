@@ -109,11 +109,14 @@ def calibrate(arm: str = "mot", steps: int = 150):
     from src.data.stage2_routed_stream import PackedRoutedStream
     from src.data.stage2_stream_dataset import PackedDomainStream, PackedMixedStream
     from src.model.baseline_model import BaselineModel
+    from src.model.mot_hybrid_model import MoTHybridModel
     from src.model.mot_model import MoTModel
+    from src.model.mot_pooled2_model import MoTPooled2Model
     from src.model.mot_pooled_model import MoTPooledModel
     from src.model.mot_routed_model import MoTRoutedModel
     from src.model.stage2_config import (
-        BACKBONE_ONLY_CFG, BATCH_SIZE, CONFIDENCE_WEIGHT, FOCAL_GAMMA, MODEL_CFG, SWITCH_WEIGHT,
+        BACKBONE_ONLY_CFG, BATCH_SIZE, CONFIDENCE_WEIGHT, FOCAL_GAMMA, HYBRID_NATURAL_DATA_FRACTION,
+        MODEL_CFG, SWITCH_WEIGHT,
     )
     from torch.utils.data import DataLoader
     import torch.nn.functional as F
@@ -131,6 +134,11 @@ def calibrate(arm: str = "mot", steps: int = 150):
     elif arm == "pooled":
         model = MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
                                focal_gamma=FOCAL_GAMMA, confidence_weight=CONFIDENCE_WEIGHT).to(device)
+    elif arm == "hybrid":
+        model = MoTHybridModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "pooled2":
+        model = MoTPooled2Model(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
+                                focal_gamma=FOCAL_GAMMA).to(device)
     elif arm == "baseline":
         model = BaselineModel(vocab_size=bundle.baseline_vocab_size, **BACKBONE_ONLY_CFG).to(device)
     else:
@@ -139,17 +147,32 @@ def calibrate(arm: str = "mot", steps: int = 150):
 
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-    if arm == "mot":
+    if arm in ("mot", "hybrid"):
         domains = list(bundle.domain_vocab_sizes)
         loaders = {
             d: iter(DataLoader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
-    elif arm in ("routed", "pooled"):
+    if arm in ("routed", "pooled", "pooled2", "hybrid"):
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
-    else:
+    elif arm not in ("mot",):
         encode_fn = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
         loader = iter(DataLoader(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+
+    def _hybrid_calib_batch(step: int):
+        import random
+        use_natural = random.Random(step).random() < HYBRID_NATURAL_DATA_FRACTION
+        if use_natural:
+            domain = domains[step % len(domains)]
+            _, ids, types = next(loaders[domain])
+            ids, types = ids.to(device), types.to(device)
+            inp, tgt = ids[:, :-1], ids[:, 1:]
+            typ = types[:, :-1]
+            dom = torch.full_like(inp, domain_index[domain])
+            ctrl = torch.zeros_like(inp)
+            return inp, dom, ctrl, typ, tgt
+        tok, dom, ctrl, typ, tgt = next(loader)
+        return (t.to(device) for t in (tok, dom, ctrl, typ, tgt))
 
     t0 = time.time()
     for step in range(1, steps + 1):
@@ -162,11 +185,17 @@ def calibrate(arm: str = "mot", steps: int = 150):
             with torch.autocast("cuda"):
                 logits = model(domain, inp, types[:, :-1])
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
-        elif arm in ("routed", "pooled"):
+        elif arm == "hybrid":
+            tok, dom, ctrl, typ, tgt = _hybrid_calib_batch(step)
+            with torch.autocast("cuda"):
+                loss, parts = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
+                if step == 1:
+                    print(f"  loss parts: content={parts['_content']:.4f} switch={parts['_switch']:.4f}")
+        elif arm in ("routed", "pooled", "pooled2"):
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
-                if arm == "pooled":
+                if arm in ("pooled", "pooled2"):
                     # calibrate at full adversarial strength: lambda=1 is the worst case for
                     # both speed and memory, so timing here bounds the real run rather than
                     # measuring the cheap early-ramp steps.
@@ -223,13 +252,15 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
     from src.data.stage2_routed_stream import PackedRoutedStream
     from src.data.stage2_stream_dataset import PackedDomainStream, PackedMixedStream
     from src.model.baseline_model import BaselineModel
+    from src.model.mot_hybrid_model import MoTHybridModel
     from src.model.mot_model import MoTModel
+    from src.model.mot_pooled2_model import MoTPooled2Model
     from src.model.mot_pooled_model import MoTPooledModel
     from src.model.mot_routed_model import MoTRoutedModel
     from src.model.stage2_config import (
         ADV_LAMBDA_RAMP_STEPS, ARM_LABELS, BACKBONE_ONLY_CFG, BATCH_SIZE, CHECKPOINT_EVERY,
-        CONFIDENCE_WEIGHT, FOCAL_GAMMA, GRAD_ACCUM_STEPS, LOG_EVERY, LR, MAX_STEPS,
-        MODEL_CFG, SWITCH_WEIGHT, WARMUP_STEPS,
+        CONFIDENCE_WEIGHT, FOCAL_GAMMA, GRAD_ACCUM_STEPS, HYBRID_NATURAL_DATA_FRACTION, LOG_EVERY,
+        LR, MAX_STEPS, MODEL_CFG, SWITCH_WEIGHT, WARMUP_STEPS,
     )
 
     total_steps = max_steps or MAX_STEPS
@@ -246,6 +277,11 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
     elif arm == "pooled":
         model = MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
                                focal_gamma=FOCAL_GAMMA, confidence_weight=CONFIDENCE_WEIGHT).to(device)
+    elif arm == "hybrid":
+        model = MoTHybridModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "pooled2":
+        model = MoTPooled2Model(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
+                                focal_gamma=FOCAL_GAMMA).to(device)
     elif arm == "baseline":
         model = BaselineModel(vocab_size=bundle.baseline_vocab_size, **BACKBONE_ONLY_CFG).to(device)
     else:
@@ -305,22 +341,38 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
         progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
         return 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
 
-    if arm == "mot":
+    if arm in ("mot", "hybrid"):
         domains = list(bundle.domain_vocab_sizes)
         loaders = {
             d: iter(DataLoader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
-    elif arm in ("routed", "pooled"):
+    if arm in ("routed", "pooled", "pooled2", "hybrid"):
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
-    else:
+    elif arm not in ("mot",):
         encode_fn = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
         loader = iter(DataLoader(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
 
-    # Arm 5 only: loss-trajectory controller (spike-skip + plateau rescue + online LR).
-    # Kept off every other arm so it never confounds the matched-compute comparison.
+    def _hybrid_train_batch(step: int):
+        import random
+        use_natural = random.Random(step).random() < HYBRID_NATURAL_DATA_FRACTION
+        if use_natural:
+            domain = domains[step % len(domains)]
+            _, ids, types = next(loaders[domain])
+            ids, types = ids.to(device), types.to(device)
+            inp, tgt = ids[:, :-1], ids[:, 1:]
+            typ = types[:, :-1]
+            dom = torch.full_like(inp, domain_index[domain])
+            ctrl = torch.zeros_like(inp)
+            return inp, dom, ctrl, typ, tgt
+        tok, dom, ctrl, typ, tgt = next(loader)
+        return (t.to(device) for t in (tok, dom, ctrl, typ, tgt))
+
+    # Arms 5+: loss-trajectory controller (spike-skip + plateau rescue + online LR).
+    # Kept off mot/baseline/sota/routed so it never confounds the matched-compute comparison
+    # for the original 4-way ablation; every new complex-loss arm gets it by default.
     controller = None
-    if arm == "pooled":
+    if arm in ("pooled", "pooled2", "hybrid"):
         from src.model.adaptive_optimizer import AdaptiveController
         controller = AdaptiveController()
         print("adaptive controller ON (spike-guard + plateau rescue + online LR)", flush=True)
@@ -346,7 +398,12 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
-        elif arm == "pooled":
+        elif arm == "hybrid":
+            tok, dom, ctrl, typ, tgt = _hybrid_train_batch(step)
+            with torch.autocast("cuda"):
+                loss, parts = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
+            controller_loss = parts["_content"]
+        elif arm in ("pooled", "pooled2"):
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             # DANN's adversarial strength ramps 0 -> 1 rather than starting hot: full
@@ -375,8 +432,9 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
         loss_val = loss.item()
         # controller_loss is the mean of the model's per-domain CE entries, which are already
         # Python floats (per_domain[domain] = float(...) in the model) - so it's a float, not a
-        # tensor. The controller is None for every other arm, so this is consumed only for pooled.
-        controller_loss_val = float(controller_loss) if arm == "pooled" else loss_val
+        # tensor. The controller is None for arms that don't set it, so this is only consumed
+        # for pooled/pooled2/hybrid.
+        controller_loss_val = float(controller_loss) if arm in ("pooled", "pooled2", "hybrid") else loss_val
         # #1 spike guard (pooled only): a NaN/Inf or a loss spiking far above the running
         # mean is a bad batch - drop its gradient entirely rather than let one poisoned step
         # corrupt the weights (same instinct as banning a checkpoint that emits NaN). Spike
