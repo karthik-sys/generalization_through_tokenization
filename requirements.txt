@@ -1,0 +1,10 @@
+datasets>=2.19
+tokenizers>=0.19
+sentencepiece>=0.2
+morfessor>=2.0
+pyphen>=0.14
+torch>=2.2
+numpy>=1.26
+huggingface_hub>=0.23
+tiktoken>=0.7
+zstandard>=0.22

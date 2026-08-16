@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# raw + processed corpora — large, reproducible from src/data/download.py
+data/**/*
+!data/**/.gitkeep
+!data/**/README.md
+
+# trained tokenizers / checkpoints (reproducible; stage-2 set lives on the Modal volume)
+# leading slash anchors to repo root so src/tokenizers/ (source code) is NOT ignored
+/tokenizers/
+/tokenizers_stage2/
+*.model
+*.vocab
+*.bin
+checkpoints/
+*.pt
+*.safetensors
+
+.DS_Store
