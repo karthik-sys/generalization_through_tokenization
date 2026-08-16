@@ -72,12 +72,20 @@ STREAM_SOURCES = {
     #     real methodological problem, not just a training-diversity one) leaves no genuinely
     #     unseen Python left for held-out eval, forcing a JS-as-stand-in workaround there.
     #   codeparrot/github-code - swapped in 2026-08-16. Ungated, large (real GitHub source
-    #     across languages), confirmed streamable. Filtered to Python + permissive licenses
-    #     (see CODE_LICENSE_ALLOWLIST) - the license column exists precisely because this
-    #     dataset does NOT pre-filter by license, so filtering here is a real choice, not
-    #     a formality. Fixes the held-out contamination problem too: large enough that a
-    #     `.skip()`-based held-out split is genuinely unseen, same as the other domains.
-    "code": {"path": "codeparrot/github-code", "name": None, "gated": False},
+    #     across languages), filtered to Python + permissive licenses (see
+    #     CODE_LICENSE_ALLOWLIST - the license column exists precisely because this dataset
+    #     does NOT pre-filter by license). Fixes the held-out contamination problem too:
+    #     large enough that a `.skip()`-based held-out split is genuinely unseen.
+    #     NOTE: the dataset's own loading script is a legacy HF "dataset script", which
+    #     current `datasets` versions refuse to run at all ("Dataset scripts are no longer
+    #     supported") - confirmed broken on Modal's image even though it loaded fine on an
+    #     older local `datasets` version, which is exactly the kind of environment mismatch
+    #     that bit proof-pile-2 earlier. Fix: HF auto-converts most datasets to Parquet on
+    #     a `refs/convert/parquet` branch; that conversion organises github-code into
+    #     per-language folders, so `data_files` targets Python directly without downloading
+    #     the other ~20 languages.
+    "code": {"path": "codeparrot/github-code", "name": None, "gated": False,
+             "revision": "refs/convert/parquet", "data_files": "Python-all/partial-train/*.parquet"},
     "math": {"path": "open-web-math/open-web-math", "name": None, "gated": False},
     # EleutherAI/proof-pile-2's "arxiv" config uses a legacy loading script whose zstd
     # decompression path is broken with current zstandard tooling (reproducible

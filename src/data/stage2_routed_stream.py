@@ -41,7 +41,10 @@ def _raw_body_stream(domain: str) -> Iterator[str]:
     """
     while True:
         cfg = STREAM_SOURCES[domain]
-        stream = load_dataset(cfg["path"], name=cfg.get("name"), split="train", streaming=True)
+        stream = load_dataset(
+            cfg["path"], name=cfg.get("name"), revision=cfg.get("revision"),
+            data_files=cfg.get("data_files"), split="train", streaming=True,
+        )
         extractor = TEXT_EXTRACTORS[domain]
         for row in stream:
             text = extractor(row)

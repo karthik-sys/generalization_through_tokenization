@@ -480,27 +480,102 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
                 out.append(c.swapcase())
         return "".join(out)
 
-    def held_out_doc_stream(domain: str, noisy: bool = False):
-        from src.data.stage2_stream_dataset import DOC_SEP, TEXT_EXTRACTORS
-        from src.model.stage2_config import DOMAIN_TAG
+    def held_out_body_stream(domain: str, noisy: bool = False):
+        """Plain body text (no tag, no DOC_SEP), for composing synthetic held-out
+        multi-domain docs. codeparrot/github-code is large enough for a genuine
+        `.skip()` split like every other domain now - the old the-stack-smol
+        stand-in needed a different-language hack because it wasn't."""
+        from src.data.stage2_stream_dataset import TEXT_EXTRACTORS
 
-        tag = DOMAIN_TAG[domain]
-        if domain == "code":
-            # different language = genuinely unseen, but a real distribution shift - not a clean held-out set
-            stream = load_dataset("bigcode/the-stack-smol", split="train", streaming=True)
-            stream = (r for r in stream if r.get("lang", "").lower() == "javascript")
-            for row in stream:
-                body = _corrupt(row["content"]) if noisy else row["content"]
-                yield f"{tag}\n{body}{DOC_SEP}"
-            return
         cfg = STREAM_SOURCES[domain]
-        stream = load_dataset(cfg["path"], name=cfg.get("name"), split="train", streaming=True).skip(SKIP_DOCS)
+        stream = load_dataset(
+            cfg["path"], name=cfg.get("name"), revision=cfg.get("revision"),
+            data_files=cfg.get("data_files"), split="train", streaming=True,
+        ).skip(SKIP_DOCS)
         extractor = TEXT_EXTRACTORS[domain]
         for row in stream:
             text = extractor(row)
             if text:
-                body = _corrupt(text) if noisy else text
-                yield f"{tag}\n{body}{DOC_SEP}"
+                yield _corrupt(text) if noisy else text
+
+    def held_out_doc_stream(domain: str, noisy: bool = False):
+        from src.data.stage2_stream_dataset import DOC_SEP
+        from src.model.stage2_config import DOMAIN_TAG
+
+        tag = DOMAIN_TAG[domain]
+        for body in held_out_body_stream(domain, noisy):
+            yield f"{tag}\n{body}{DOC_SEP}"
+
+    def held_out_synthetic_multidomain_stream(noisy: bool = False, seed: int = 0):
+        """Held-out mirror of stage2_routed_stream.synthetic_multidomain_doc_stream: composes
+        the same 2-4-domain synthetic docs, but every snippet comes from held_out_body_stream
+        (post-.skip()) instead of the training-time raw stream. This is what routed/pooled were
+        actually built to handle - a single sequence spanning multiple domains with real
+        switches - and it's what the eval used to skip entirely (see decision log:
+        `evaluate()`'s domain-routed branch forced every eval sequence single-domain, so
+        routed/pooled were never once tested on the capability they paid architectural cost
+        for)."""
+        import random
+
+        from src.data.stage2_routed_stream import MAX_DOMAINS_PER_DOC, MIN_DOMAINS_PER_DOC, SNIPPET_WORDS
+        from src.model.stage2_config import DOMAIN_TAG
+
+        rng = random.Random(seed)
+        domains = list(STREAM_SOURCES)
+        body_streams = {d: held_out_body_stream(d, noisy) for d in domains}
+        while True:
+            k = rng.randint(MIN_DOMAINS_PER_DOC, MAX_DOMAINS_PER_DOC)
+            chosen = rng.sample(domains, k)
+            parts = []
+            for domain in chosen:
+                text = " ".join(next(body_streams[domain]).split()[:SNIPPET_WORDS])
+                parts.append(f"{DOMAIN_TAG[domain]}\n{text}\n")
+            yield "".join(parts)
+
+    class HeldOutRoutedStream(IterableDataset):
+        """Held-out mirror of PackedRoutedStream - same windowing/target logic, sourced from
+        held_out_synthetic_multidomain_stream instead of the training-time stream."""
+
+        def __init__(self, bundle, domain_index: dict[str, int], seq_len: int, noisy: bool = False, seed: int = 0):
+            self.bundle, self.domain_index, self.seq_len = bundle, domain_index, seq_len
+            self.domains = list(domain_index)
+            self.noisy, self.seed = noisy, seed
+
+        def __iter__(self):
+            from src.data.stage2_routed_stream import _split_spans
+
+            buf_tok, buf_dom, buf_ctrl, buf_typ = [], [], [], []
+            for doc in held_out_synthetic_multidomain_stream(self.noisy, self.seed):
+                for domain, text in _split_spans(doc):
+                    if domain not in self.domain_index:
+                        continue
+                    di = self.domain_index[domain]
+                    buf_tok.append(di); buf_dom.append(di); buf_ctrl.append(1); buf_typ.append(0)
+                    ids, types = self.bundle.encode_domain(domain, text, max_len=10**9)
+                    buf_tok.extend(ids.tolist())
+                    buf_dom.extend([di] * len(ids))
+                    buf_ctrl.extend([0] * len(ids))
+                    buf_typ.extend(types.tolist() if types is not None else [0] * len(ids))
+
+                window = self.seq_len + 1
+                while len(buf_tok) >= window:
+                    c_tok, c_dom, c_ctrl, c_typ = buf_tok[:window], buf_dom[:window], buf_ctrl[:window], buf_typ[:window]
+                    targets = []
+                    for i in range(self.seq_len):
+                        nxt = i + 1
+                        if c_ctrl[nxt]:
+                            from_domain = self.domains[c_dom[i]]
+                            targets.append(self.bundle.domain_vocab_sizes[from_domain] + c_dom[nxt])
+                        else:
+                            targets.append(c_tok[nxt])
+                    yield (
+                        torch.tensor(c_tok[:self.seq_len], dtype=torch.long),
+                        torch.tensor(c_dom[:self.seq_len], dtype=torch.long),
+                        torch.tensor(c_ctrl[:self.seq_len], dtype=torch.long),
+                        torch.tensor(c_typ[:self.seq_len], dtype=torch.long),
+                        torch.tensor(targets, dtype=torch.long),
+                    )
+                    buf_tok, buf_dom, buf_ctrl, buf_typ = buf_tok[window:], buf_dom[window:], buf_ctrl[window:], buf_typ[window:]
 
     class HeldOutDomainStream(IterableDataset):
         def __init__(self, domain, encode_domain_fn, seq_len, noisy=False):
@@ -636,15 +711,59 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
 
         agg_bits = sum(nats[d] for d in domains) / LN2
         agg_bytes = sum(toks[d] * bpt[d] for d in domains)
-        result = agg_bits / max(agg_bytes, 1)
-        print(f"\nHELD-OUT BPB for {arm}, {mode} (checkpoint step {ckpt['step']}): {result:.4f} bits/byte", flush=True)
+        single_domain_bpb = agg_bits / max(agg_bytes, 1)
+        print(f"\nHELD-OUT single-domain BPB for {arm}, {mode} (checkpoint step {ckpt['step']}): "
+              f"{single_domain_bpb:.4f} bits/byte", flush=True)
         for d in domains:
             d_bpb = (nats[d] / LN2) / max(toks[d] * bpt[d], 1)
             d_ppl_tok = math.exp(nats[d] / max(toks[d], 1))
             print(f"  {d:8s} BPB={d_bpb:.4f}  (per-token ppl={d_ppl_tok:.1f}, bytes/tok={bpt[d]:.2f}, n_tok={toks[d]})", flush=True)
+
+        cross_domain_bpb, switch_accuracy = None, None
         if arm in ("routed", "pooled"):
-            print("  note: switch-prediction accuracy is a separate capability metric (needs a "
-                  "multi-domain held-out stream) - deferred, not part of this BPB ranking.", flush=True)
+            # THE fix: routed/pooled were architected for mixed-domain sequences with real
+            # switches, but the loop above forces every eval sequence single-domain. This
+            # second pass is what they were actually built to be judged on. Switch-target
+            # positions are excluded from the BPB accounting (predicting "switch to domain Y"
+            # isn't compressing content bytes) and reported separately as switch_accuracy.
+            print(f"\n--- cross-domain pass (real switches, {arm} only) ---", flush=True)
+            cd_nats, cd_toks = {d: 0.0 for d in domains}, {d: 0 for d in domains}
+            switch_correct, switch_total = 0, 0
+            cd_loader = iter(DataLoader(
+                HeldOutRoutedStream(bundle, domain_index, seq_len, noisy), batch_size=BATCH_SIZE))
+            with torch.no_grad():
+                for i in range(eval_batches):
+                    tok, dom, ctrl, typ, tgt = next(cd_loader)
+                    tok, dom, ctrl, typ, tgt = (t.to(device) for t in (tok, dom, ctrl, typ, tgt))
+                    with torch.autocast("cuda"):
+                        out = model(tok, dom, ctrl, targets=None, type_ids=typ)
+                        for d in domains:
+                            if d not in out:
+                                continue
+                            mask, logits = out[d]
+                            d_tgt = tgt[mask]
+                            is_switch = d_tgt >= bundle.domain_vocab_sizes[d]
+                            content_logits, content_tgt = logits[~is_switch], d_tgt[~is_switch]
+                            if content_tgt.numel():
+                                cd_nats[d] += F.cross_entropy(content_logits, content_tgt, reduction="sum").item()
+                                cd_toks[d] += content_tgt.numel()
+                            if is_switch.any():
+                                sw_logits, sw_tgt = logits[is_switch], d_tgt[is_switch]
+                                switch_correct += (sw_logits.argmax(dim=-1) == sw_tgt).sum().item()
+                                switch_total += sw_tgt.numel()
+                    if (i + 1) % 50 == 0:
+                        print(f"cross-domain eval batch {i+1}/{eval_batches}", flush=True)
+
+            cd_bits = sum(cd_nats[d] for d in domains) / LN2
+            cd_bytes = sum(cd_toks[d] * bpt[d] for d in domains)
+            cross_domain_bpb = cd_bits / max(cd_bytes, 1)
+            switch_accuracy = switch_correct / max(switch_total, 1)
+            print(f"\nHELD-OUT cross-domain BPB for {arm}, {mode}: {cross_domain_bpb:.4f} bits/byte "
+                  f"(vs single-domain {single_domain_bpb:.4f}); switch-prediction accuracy: "
+                  f"{switch_accuracy:.4f} ({switch_correct}/{switch_total})", flush=True)
+
+        result = {"single_domain_bpb": single_domain_bpb, "cross_domain_bpb": cross_domain_bpb,
+                  "switch_accuracy": switch_accuracy}
     else:
         encode_fn = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
         bpt = bpt_global(encode_fn)
@@ -661,10 +780,14 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
                 total_toks += tgt.numel()
                 if (i + 1) % 50 == 0:
                     print(f"eval batch {i+1}/{eval_batches}  running BPB={(total_nats/LN2)/max(total_toks*bpt,1):.4f}", flush=True)
-        result = (total_nats / LN2) / max(total_toks * bpt, 1)
+        single_domain_bpb = (total_nats / LN2) / max(total_toks * bpt, 1)
         ppl_tok = math.exp(total_nats / max(total_toks, 1))
-        print(f"\nHELD-OUT BPB for {arm}, {mode} (checkpoint step {ckpt['step']}): {result:.4f} bits/byte", flush=True)
+        print(f"\nHELD-OUT BPB for {arm}, {mode} (checkpoint step {ckpt['step']}): "
+              f"{single_domain_bpb:.4f} bits/byte", flush=True)
         print(f"  (per-token ppl={ppl_tok:.1f}, bytes/tok={bpt:.2f}, n_tok={total_toks})", flush=True)
+        # baseline/sota can't take mixed-domain input structurally (one shared vocab, no
+        # per-position routing) - there's no separate "cross-domain capability" to measure.
+        result = {"single_domain_bpb": single_domain_bpb, "cross_domain_bpb": None, "switch_accuracy": None}
 
     return result
 
@@ -683,8 +806,12 @@ def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from:
         print(f"{sec_per_step:.3f} sec/step x {MAX_STEPS} steps = {sec_per_step*MAX_STEPS/3600:.2f} GPU-hours")
         print(f"at ~$0.59/hr (T4): ~${sec_per_step*MAX_STEPS/3600*0.59:.2f} for this arm")
     elif step == "evaluate":
-        bpb = evaluate.remote(arm=arm, checkpoint_step=steps or 20000, noisy=noisy)
-        print(f"\nheld-out BPB for {arm} ({'noisy' if noisy else 'clean'}): {bpb:.4f} bits/byte")
+        result = evaluate.remote(arm=arm, checkpoint_step=steps or 20000, noisy=noisy)
+        mode = "noisy" if noisy else "clean"
+        print(f"\nheld-out single-domain BPB for {arm} ({mode}): {result['single_domain_bpb']:.4f} bits/byte")
+        if result["cross_domain_bpb"] is not None:
+            print(f"held-out cross-domain BPB for {arm} ({mode}): {result['cross_domain_bpb']:.4f} bits/byte")
+            print(f"switch-prediction accuracy: {result['switch_accuracy']:.4f}")
     elif step == "train":
         history = train.remote(arm=arm, max_steps=steps or None, resume_from=resume_from or None)
         print(f"\nfinal logged losses: {history[-5:] if history else '(none)'}")

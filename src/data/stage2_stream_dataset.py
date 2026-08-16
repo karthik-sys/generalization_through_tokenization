@@ -56,6 +56,7 @@ def _raw_doc_stream(domain: str) -> Iterator[str]:
     while True:
         stream = load_dataset(
             cfg["path"], name=cfg.get("name"), data_dir=cfg.get("data_dir"),
+            revision=cfg.get("revision"), data_files=cfg.get("data_files"),
             split="train", streaming=True,
         )
         if pass_num:

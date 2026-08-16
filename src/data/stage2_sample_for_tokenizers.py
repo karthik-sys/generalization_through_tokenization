@@ -26,7 +26,11 @@ def sample_domain(domain: str, out_dir: str = "data/stage2_tokenizer_sample") ->
     if cfg.get("gated"):
         print(f"{domain}: source is gated ({cfg['path']}) - accept its terms on huggingface.co and run "
               f"`huggingface-cli login` before this will work.")
-    stream = load_dataset(cfg["path"], name=cfg.get("name"), data_dir=cfg.get("data_dir"), split="train", streaming=True)
+    stream = load_dataset(
+        cfg["path"], name=cfg.get("name"), data_dir=cfg.get("data_dir"),
+        revision=cfg.get("revision"), data_files=cfg.get("data_files"),
+        split="train", streaming=True,
+    )
     rows = []
     for row in itertools.islice(stream, N_SAMPLE):
         text = TEXT_EXTRACTORS[domain](row)
