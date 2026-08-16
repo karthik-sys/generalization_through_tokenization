@@ -56,17 +56,26 @@ def _snippet(text: str, max_words: int) -> str:
     return " ".join(text.split()[:max_words])
 
 
-def synthetic_multidomain_doc_stream(seed: int = 0) -> Iterator[str]:
-    """Yields doc strings shaped like build_multidomain_docs.py's output, built live."""
+def synthetic_multidomain_doc_stream(
+    seed: int = 0, min_domains: int = MIN_DOMAINS_PER_DOC, max_domains: int = MAX_DOMAINS_PER_DOC,
+    snippet_words: int = SNIPPET_WORDS,
+) -> Iterator[str]:
+    """Yields doc strings shaped like build_multidomain_docs.py's output, built live.
+
+    min_domains/max_domains/snippet_words are parameterized (not just module constants) so
+    arm "routed3" can train on denser cross-domain composition - always all 4 domains per
+    doc, shorter snippets so more switches fit in a fixed 1024-token window - without a
+    separate stream implementation. Defaults match the original routed/hybrid/routed2 shape.
+    """
     rng = random.Random(seed)
     domains = list(STREAM_SOURCES)
     body_streams = {d: _raw_body_stream(d) for d in domains}
     while True:
-        k = rng.randint(MIN_DOMAINS_PER_DOC, MAX_DOMAINS_PER_DOC)
+        k = rng.randint(min_domains, min(max_domains, len(domains)))
         chosen = rng.sample(domains, k)
         parts = []
         for domain in chosen:
-            text = _snippet(next(body_streams[domain]), SNIPPET_WORDS)
+            text = _snippet(next(body_streams[domain]), snippet_words)
             parts.append(f"{DOMAIN_TAG[domain]}\n{text}\n")
         yield "".join(parts)
 
@@ -74,16 +83,25 @@ def synthetic_multidomain_doc_stream(seed: int = 0) -> Iterator[str]:
 class PackedRoutedStream(IterableDataset):
     """Yields (token_ids, domain_ids, is_control, type_ids, targets), each (seq_len,)."""
 
-    def __init__(self, bundle, domain_index: dict[str, int], seq_len: int, seed: int = 0):
+    def __init__(
+        self, bundle, domain_index: dict[str, int], seq_len: int, seed: int = 0,
+        min_domains: int = MIN_DOMAINS_PER_DOC, max_domains: int = MAX_DOMAINS_PER_DOC,
+        snippet_words: int = SNIPPET_WORDS,
+    ):
         self.bundle = bundle
         self.domain_index = domain_index
         self.domains = list(domain_index)
         self.seq_len = seq_len
         self.seed = seed
+        self.min_domains = min_domains
+        self.max_domains = max_domains
+        self.snippet_words = snippet_words
 
     def __iter__(self):
         buf_tok, buf_dom, buf_ctrl, buf_typ = [], [], [], []
-        for doc in synthetic_multidomain_doc_stream(self.seed):
+        doc_stream = synthetic_multidomain_doc_stream(
+            self.seed, self.min_domains, self.max_domains, self.snippet_words)
+        for doc in doc_stream:
             for domain, text in _split_spans(doc):
                 if domain not in self.domain_index:
                     continue

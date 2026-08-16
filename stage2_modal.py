@@ -139,6 +139,8 @@ def calibrate(arm: str = "mot", steps: int = 150):
     elif arm == "pooled2":
         model = MoTPooled2Model(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
                                 focal_gamma=FOCAL_GAMMA).to(device)
+    elif arm in ("routed2", "routed3"):
+        model = MoTHybridModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "baseline":
         model = BaselineModel(vocab_size=bundle.baseline_vocab_size, **BACKBONE_ONLY_CFG).to(device)
     else:
@@ -153,8 +155,15 @@ def calibrate(arm: str = "mot", steps: int = 150):
             d: iter(DataLoader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
-    if arm in ("routed", "pooled", "pooled2", "hybrid"):
+    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2"):
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+    elif arm == "routed3":
+        from src.model.stage2_config import ROUTED3_MAX_DOMAINS, ROUTED3_MIN_DOMAINS, ROUTED3_SNIPPET_WORDS
+        loader = iter(DataLoader(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"],
+            min_domains=ROUTED3_MIN_DOMAINS, max_domains=ROUTED3_MAX_DOMAINS,
+            snippet_words=ROUTED3_SNIPPET_WORDS,
+        ), batch_size=BATCH_SIZE))
     elif arm not in ("mot",):
         encode_fn = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
         loader = iter(DataLoader(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
@@ -187,6 +196,13 @@ def calibrate(arm: str = "mot", steps: int = 150):
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
         elif arm == "hybrid":
             tok, dom, ctrl, typ, tgt = _hybrid_calib_batch(step)
+            with torch.autocast("cuda"):
+                loss, parts = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
+                if step == 1:
+                    print(f"  loss parts: content={parts['_content']:.4f} switch={parts['_switch']:.4f}")
+        elif arm in ("routed2", "routed3"):
+            tok, dom, ctrl, typ, tgt = next(loader)
+            tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
                 loss, parts = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
                 if step == 1:
@@ -282,6 +298,8 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
     elif arm == "pooled2":
         model = MoTPooled2Model(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
                                 focal_gamma=FOCAL_GAMMA).to(device)
+    elif arm in ("routed2", "routed3"):
+        model = MoTHybridModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "baseline":
         model = BaselineModel(vocab_size=bundle.baseline_vocab_size, **BACKBONE_ONLY_CFG).to(device)
     else:
@@ -347,8 +365,15 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
             d: iter(DataLoader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
-    if arm in ("routed", "pooled", "pooled2", "hybrid"):
+    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2"):
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+    elif arm == "routed3":
+        from src.model.stage2_config import ROUTED3_MAX_DOMAINS, ROUTED3_MIN_DOMAINS, ROUTED3_SNIPPET_WORDS
+        loader = iter(DataLoader(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"],
+            min_domains=ROUTED3_MIN_DOMAINS, max_domains=ROUTED3_MAX_DOMAINS,
+            snippet_words=ROUTED3_SNIPPET_WORDS,
+        ), batch_size=BATCH_SIZE))
     elif arm not in ("mot",):
         encode_fn = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
         loader = iter(DataLoader(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
@@ -372,7 +397,7 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
     # Kept off mot/baseline/sota/routed so it never confounds the matched-compute comparison
     # for the original 4-way ablation; every new complex-loss arm gets it by default.
     controller = None
-    if arm in ("pooled", "pooled2", "hybrid"):
+    if arm in ("pooled", "pooled2", "hybrid", "routed2", "routed3"):
         from src.model.adaptive_optimizer import AdaptiveController
         controller = AdaptiveController()
         print("adaptive controller ON (spike-guard + plateau rescue + online LR)", flush=True)
@@ -400,6 +425,12 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
         elif arm == "hybrid":
             tok, dom, ctrl, typ, tgt = _hybrid_train_batch(step)
+            with torch.autocast("cuda"):
+                loss, parts = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
+            controller_loss = parts["_content"]
+        elif arm in ("routed2", "routed3"):
+            tok, dom, ctrl, typ, tgt = next(loader)
+            tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
                 loss, parts = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
             controller_loss = parts["_content"]
@@ -434,7 +465,7 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
         # Python floats (per_domain[domain] = float(...) in the model) - so it's a float, not a
         # tensor. The controller is None for arms that don't set it, so this is only consumed
         # for pooled/pooled2/hybrid.
-        controller_loss_val = float(controller_loss) if arm in ("pooled", "pooled2", "hybrid") else loss_val
+        controller_loss_val = float(controller_loss) if arm in ("pooled", "pooled2", "hybrid", "routed2", "routed3") else loss_val
         # #1 spike guard (pooled only): a NaN/Inf or a loss spiking far above the running
         # mean is a bad batch - drop its gradient entirely rather than let one poisoned step
         # corrupt the weights (same instinct as banning a checkpoint that emits NaN). Spike
@@ -683,7 +714,7 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{arm}_step{checkpoint_step}.pt", map_location=device)
 
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
-    domain_routed = arm in ("mot", "routed", "pooled")  # arms with disjoint per-domain heads
+    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3")  # arms with disjoint per-domain heads
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "routed":
@@ -778,7 +809,12 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
             print(f"  {d:8s} BPB={d_bpb:.4f}  (per-token ppl={d_ppl_tok:.1f}, bytes/tok={bpt[d]:.2f}, n_tok={toks[d]})", flush=True)
 
         cross_domain_bpb, switch_accuracy = None, None
-        if arm in ("routed", "pooled"):
+        if arm != "mot":
+            # mot is the only domain_routed arm without switching capability at all - every
+            # other one (routed, pooled, hybrid, pooled2, routed2, routed3) descends from
+            # MoTRoutedModel and supports the control-token/switch mechanism, so this is
+            # "domain_routed and switching-capable" rather than an explicit arm list that
+            # needs updating every time a new switching arm is added.
             # THE fix: routed/pooled were architected for mixed-domain sequences with real
             # switches, but the loop above forces every eval sequence single-domain. This
             # second pass is what they were actually built to be judged on. Switch-target
@@ -850,6 +886,178 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     return result
 
 
+@app.function(image=image, gpu="T4", volumes={VOLUME_PATH: volume}, timeout=1800,
+              secrets=[modal.Secret.from_name("huggingface-token")])
+def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples: int = 500):
+    """LAMBADA (Paperno et al. 2016): predict the final word of a passage, given the full
+    preceding context. Deliberately NOT the same axis as BPB - BPB measures compression on
+    held-out text drawn from the SAME domains/tokenizers the model trained on, so a model
+    architected around domain-specific vocab has a structural advantage there almost by
+    construction. LAMBADA is a fixed, external, architecture-agnostic completion benchmark -
+    it doesn't care whose vocab is whose, it just asks "did you predict the right word."
+
+    It's also one of the few standard benchmarks that stays meaningful at our scale (~70-120M
+    params). MMLU/GSM8K/HumanEval are calibrated for billion-parameter, often instruction-
+    tuned models and would put every arm here at or near random-chance floor - not because
+    any arm failed, but because those benchmarks can't see anything at this size. LAMBADA has
+    shown real, differentiated signal since the GPT-2-small era, which is our regime.
+
+    All LAMBADA text is routed through the "nlp" domain for domain-routed arms (mot, routed,
+    pooled, hybrid, pooled2) - it's natural English prose, the same kind of content nlp's
+    tokenizer and embedding table were trained on. baseline/sota use their single shared
+    vocab directly, no domain routing to speak of.
+
+    Scoring: exact-match on the tokenized answer word, teacher-forced (the true context is
+    given; the model doesn't need to have generated it correctly, it's scored on next-token
+    predictions at each position of the answer). This is stricter than accuracy computed only
+    on the answer's first token, but it's the fair choice here - different tokenizers split
+    the same word into different numbers of pieces, so first-token-only would silently
+    advantage whichever tokenizer happens to chunk more coarsely.
+    """
+    _setup_paths()
+    import os
+
+    os.chdir("/root/repo")
+    import torch
+    from datasets import load_dataset
+
+    from src.data.build_examples import TokenizerBundle
+    from src.model.baseline_model import BaselineModel
+    from src.model.mot_hybrid_model import MoTHybridModel
+    from src.model.mot_model import MoTModel
+    from src.model.mot_pooled2_model import MoTPooled2Model
+    from src.model.mot_pooled_model import MoTPooledModel
+    from src.model.mot_routed_model import MoTRoutedModel
+    from src.model.stage2_config import BACKBONE_ONLY_CFG, CONFIDENCE_WEIGHT, FOCAL_GAMMA, MODEL_CFG
+
+    device = "cuda"
+    seq_len = MODEL_CFG["max_seq_len"]
+    bundle = TokenizerBundle(tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2")
+    ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{arm}_step{checkpoint_step}.pt", map_location=device)
+
+    domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
+    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3")
+    if arm == "mot":
+        model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "routed":
+        model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "pooled":
+        model = MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
+                               focal_gamma=FOCAL_GAMMA, confidence_weight=CONFIDENCE_WEIGHT).to(device)
+    elif arm == "hybrid":
+        model = MoTHybridModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "pooled2":
+        model = MoTPooled2Model(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
+                                focal_gamma=FOCAL_GAMMA).to(device)
+    elif arm in ("routed2", "routed3"):
+        model = MoTHybridModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "baseline":
+        model = BaselineModel(vocab_size=bundle.baseline_vocab_size, **BACKBONE_ONLY_CFG).to(device)
+    else:
+        model = BaselineModel(vocab_size=bundle.sota_vocab_size, **BACKBONE_ONLY_CFG).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    print(f"loaded {arm} checkpoint at step {ckpt['step']}", flush=True)
+
+    ds = load_dataset("EleutherAI/lambada_openai", "en", split="test", streaming=True)
+    encode_fn = None
+    if not domain_routed:
+        encode_fn = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
+
+    import math
+    LN2 = math.log(2)
+    n_correct, n_scored, n_skipped = 0, 0, 0
+    total_nats, total_target_tokens = 0.0, 0
+    with torch.no_grad():
+        for i, row in enumerate(ds):
+            if n_scored >= n_examples:
+                break
+            text = row["text"]
+            if " " not in text.strip():
+                n_skipped += 1
+                continue
+            context, target_word = text.rsplit(" ", 1)
+            # Every arm trained exclusively on tag-prefixed documents (_raw_doc_stream
+            # prepends "<domain:X>\n" to every document, baseline/sota's PackedMixedStream
+            # included) - testing on naked untagged text is out-of-distribution formatting,
+            # not a fair completion test. The tag matters far more for baseline/sota than
+            # for domain-routed arms: mot/routed/pooled get their embedding-table/head
+            # routing from the explicit encode_domain("nlp", ...) call below regardless of
+            # what the text says, but baseline/sota have no external routing at all - the
+            # tag is their ONLY signal for what kind of text follows.
+            from src.model.stage2_config import DOMAIN_TAG
+            context = f"{DOMAIN_TAG['nlp']}\n{context} "  # trailing space: target tokenizes as a natural continuation
+
+            if domain_routed:
+                ctx_ids, ctx_types = bundle.encode_domain("nlp", context, max_len=10**9)
+                tgt_ids, tgt_types = bundle.encode_domain("nlp", target_word, max_len=10**9)
+            else:
+                ctx_ids, tgt_ids = encode_fn(context, max_len=10**9), encode_fn(target_word, max_len=10**9)
+                ctx_types = tgt_types = None
+
+            n_ctx, n_tgt = len(ctx_ids), len(tgt_ids)
+            if n_tgt == 0 or n_ctx == 0 or n_ctx + n_tgt > seq_len:
+                n_skipped += 1
+                continue
+
+            full_ids = torch.cat([ctx_ids, tgt_ids]).unsqueeze(0).to(device)
+            full_types = None
+            if ctx_types is not None:
+                full_types = torch.cat([ctx_types, tgt_types]).unsqueeze(0).to(device)
+
+            with torch.autocast("cuda"):
+                if arm == "mot":
+                    logits = model("nlp", full_ids[:, :-1], full_types[:, :-1] if full_types is not None else None)
+                elif domain_routed:
+                    di = domain_index["nlp"]
+                    dom = torch.full_like(full_ids[:, :-1], di)
+                    ctrl = torch.zeros_like(full_ids[:, :-1])
+                    typ_in = full_types[:, :-1] if full_types is not None else None
+                    out = model(full_ids[:, :-1], dom, ctrl, targets=None, type_ids=typ_in)
+                    _, logits = out["nlp"]
+                    logits = logits.unsqueeze(0)  # (1, L, vocab) to match the mot/baseline shape below
+                else:
+                    logits = model(full_ids[:, :-1])
+
+            # input position i predicts full_ids position i+1; the first target token sits at
+            # full_ids position n_ctx, so its prediction comes from input position n_ctx-1.
+            target_logits = logits[0, n_ctx - 1:]
+            pred_ids = target_logits.argmax(dim=-1)
+            true_ids = full_ids[0, n_ctx:]
+            correct = torch.equal(pred_ids[: len(true_ids)], true_ids)
+            n_correct += int(correct)
+            n_scored += 1
+
+            # Perplexity/BPB-style score on the target word's tokens - a continuous signal
+            # that still differentiates arms even where strict exact-match saturates to 0
+            # (LAMBADA is a notoriously hard, near-binary benchmark for small/undertrained
+            # models; a floored accuracy metric would be exactly as uninformative here as
+            # MMLU/GSM8K are at this scale - this is the fix for that, not a new problem).
+            step_nats = torch.nn.functional.cross_entropy(
+                target_logits[: len(true_ids)], true_ids, reduction="sum"
+            )
+            total_nats += step_nats.item()
+            total_target_tokens += len(true_ids)
+
+            if n_scored % 100 == 0:
+                running_ppl = math.exp(total_nats / max(total_target_tokens, 1))
+                print(f"  {n_scored}/{n_examples}  running accuracy={n_correct/n_scored:.4f}  "
+                      f"target-token ppl={running_ppl:.1f}", flush=True)
+
+    accuracy = n_correct / max(n_scored, 1)
+    target_ppl = math.exp(total_nats / max(total_target_tokens, 1))
+    target_bpb = (total_nats / LN2) / max(total_target_tokens, 1)  # nats->bits per target TOKEN, not byte -
+    # LAMBADA targets are single words of varying byte length, so this is bits/token not a
+    # true bits/byte; still directly comparable across arms since it's the same target-token
+    # definition for everyone, same spirit as why plain BPB divides by bytes instead of tokens
+    # for domain text - here the "unit" being predicted (one target word) is already fixed.
+    print(f"\nLAMBADA for {arm} (checkpoint step {ckpt['step']}): "
+          f"exact-match accuracy={accuracy:.4f} ({n_correct}/{n_scored} scored, {n_skipped} skipped)  "
+          f"target-token perplexity={target_ppl:.2f}  bits/target-token={target_bpb:.3f}", flush=True)
+    return {"accuracy": accuracy, "target_token_ppl": target_ppl, "bits_per_target_token": target_bpb,
+            "n_scored": n_scored, "n_skipped": n_skipped}
+
+
 @app.local_entrypoint()
 def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from: str = "", noisy: bool = False):
     """steps=0 means "use the default": 150 for calibrate, MAX_STEPS for train."""
@@ -873,5 +1081,10 @@ def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from:
     elif step == "train":
         history = train.remote(arm=arm, max_steps=steps or None, resume_from=resume_from or None)
         print(f"\nfinal logged losses: {history[-5:] if history else '(none)'}")
+    elif step == "evaluate-lambada":
+        result = evaluate_lambada.remote(arm=arm, checkpoint_step=steps or 150000)
+        print(f"\nLAMBADA for {arm}: accuracy={result['accuracy']:.4f}  "
+              f"target-token ppl={result['target_token_ppl']:.2f}  "
+              f"bits/target-token={result['bits_per_target_token']:.3f}")
     else:
         raise ValueError(f"unknown step: {step}")

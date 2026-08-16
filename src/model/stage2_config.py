@@ -109,6 +109,8 @@ ARM_LABELS = {
     "pooled": "MoT + routing + PMA/DANN + fitting-loss (focal, per-domain-norm, confidence)",
     "hybrid": "MoT-Routed-Adaptive hybrid (GradNorm switch loss + blended natural/synthetic data)",
     "pooled2": "Pooled v2 (GradNorm loss, sparse top-2/16 routing, 256-chunk PMA, no confidence head)",
+    "routed2": "Routed + GradNorm switch loss ONLY (data unchanged - isolates hybrid's loss-fix credit)",
+    "routed3": "Routed + GradNorm + maximized cross-domain density (always 4 domains/doc, shorter snippets)",
 }
 
 # arm="hybrid" only: fraction of training steps drawing a natural single-domain batch
@@ -118,6 +120,18 @@ ARM_LABELS = {
 # text, which is a plausible reason its raw content-modelling trails MoT even before
 # accounting for the switch-prediction burden.
 HYBRID_NATURAL_DATA_FRACTION = 0.6
+
+# arm="routed3" only: hybrid moves routed TOWARD more single-domain data (60% natural,
+# above). routed3 tests the opposite direction - LESS single-domain, MORE cross-domain
+# density than routed/routed2 even see by default (MIN/MAX_DOMAINS_PER_DOC=2-4,
+# SNIPPET_WORDS=250 in stage2_routed_stream.py). Every doc uses all 4 domains, and shorter
+# snippets pack more switches into the same 1024-token window. Both use the same GradNorm
+# switch-loss fix as routed2, so any difference between them isolates "does pushing further
+# in the direction that's already winning (routed's cross-domain BPB/LAMBADA) help more than
+# just fixing the loss".
+ROUTED3_MIN_DOMAINS = 4
+ROUTED3_MAX_DOMAINS = 4
+ROUTED3_SNIPPET_WORDS = 100
 DOMAIN_TAG = {
     "code": "<domain:code>",
     "math": "<domain:math>",
