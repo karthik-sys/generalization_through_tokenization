@@ -57,22 +57,27 @@ ADV_LAMBDA_RAMP_STEPS = 10000
 FOCAL_GAMMA = 2.0
 CONFIDENCE_WEIGHT = 0.1
 
+# Permissive-only, deliberately excludes copyleft (gpl-*, agpl-*, lgpl-*) - codeparrot/
+# github-code includes a license column precisely because it does not filter for you.
+CODE_LICENSE_ALLOWLIST = {"mit", "apache-2.0", "bsd-3-clause", "bsd-2-clause", "isc"}
+
 # Full-size stage-2 sources (docs/dataset_methodology.md) - streamed, never fully downloaded.
 STREAM_SOURCES = {
-    # the-stack-v2-dedup is unusable here for two independent reasons, both confirmed
-    # 2026-08-15: (1) gated with no auto-approval - the hub says "ask for access";
-    # (2) even with access it stores only SWHIDs/blob_ids, not file content - getting
-    # the actual code needs AWS credentials plus a separate agreement with Software
-    # Heritage/INRIA. the-stack-dedup (v1) has inline `content` and is auto-gated.
-    # Code source history, all confirmed 2026-08-15:
+    # Code source history:
     #   the-stack-v2-dedup - gated with NO auto-approval, and stores only SWHID pointers;
     #     real content needs AWS creds + a Software Heritage/INRIA agreement. Unusable.
     #   the-stack-dedup (v1) - has inline `content`, but also gated with no access yet.
-    #     Preferred target: accept terms at huggingface.co/datasets/bigcode/the-stack-dedup
-    #     then switch this entry back to it.
-    #   the-stack-smol - accessible now (terms already accepted), ~10k python files. Small
-    #     enough that the stream restarts (see _raw_doc_stream) rather than running dry.
-    "code": {"path": "bigcode/the-stack-smol", "name": None, "gated": True},
+    #   the-stack-smol - used through 2026-08-16. Accessible, but only ~10k Python files -
+    #     small enough that a 150k-step run cycles the whole pool many times over, and (a
+    #     real methodological problem, not just a training-diversity one) leaves no genuinely
+    #     unseen Python left for held-out eval, forcing a JS-as-stand-in workaround there.
+    #   codeparrot/github-code - swapped in 2026-08-16. Ungated, large (real GitHub source
+    #     across languages), confirmed streamable. Filtered to Python + permissive licenses
+    #     (see CODE_LICENSE_ALLOWLIST) - the license column exists precisely because this
+    #     dataset does NOT pre-filter by license, so filtering here is a real choice, not
+    #     a formality. Fixes the held-out contamination problem too: large enough that a
+    #     `.skip()`-based held-out split is genuinely unseen, same as the other domains.
+    "code": {"path": "codeparrot/github-code", "name": None, "gated": False},
     "math": {"path": "open-web-math/open-web-math", "name": None, "gated": False},
     # EleutherAI/proof-pile-2's "arxiv" config uses a legacy loading script whose zstd
     # decompression path is broken with current zstandard tooling (reproducible

@@ -19,10 +19,21 @@ import torch
 from datasets import load_dataset
 from torch.utils.data import IterableDataset
 
-from src.model.stage2_config import DOMAIN_TAG, STREAM_SOURCES
+from src.model.stage2_config import CODE_LICENSE_ALLOWLIST, DOMAIN_TAG, STREAM_SOURCES
+
+
+def _extract_code(r: dict) -> str | None:
+    """codeparrot/github-code spans every language and license in one stream - both need
+    filtering here, not left to the caller (see CODE_LICENSE_ALLOWLIST)."""
+    if r.get("language") != "Python":
+        return None
+    if r.get("license") not in CODE_LICENSE_ALLOWLIST:
+        return None
+    return r.get("code")
+
 
 TEXT_EXTRACTORS = {
-    "code": lambda r: r.get("content"),
+    "code": _extract_code,
     "math": lambda r: r.get("text"),
     "science": lambda r: (f"{r['title']}\n{r['abstract']}" if r.get("abstract") else None),
     "nlp": lambda r: r.get("text"),

@@ -32,14 +32,14 @@ MAX_DOMAINS_PER_DOC = 4
 
 
 def _raw_body_stream(domain: str) -> Iterator[str]:
-    """Yields plain body text (no tag) for one domain, cycling forever."""
+    """Yields plain body text (no tag) for one domain, cycling forever.
+
+    No domain-specific branch here anymore - code used to hardcode the-stack-smol with its
+    own inline language filter, bypassing STREAM_SOURCES/TEXT_EXTRACTORS entirely. Now that
+    TEXT_EXTRACTORS['code'] does its own language+license filtering (see stage2_stream_
+    dataset.py), the generic path below works for every domain, code included.
+    """
     while True:
-        if domain == "code":
-            stream = load_dataset("bigcode/the-stack-smol", split="train", streaming=True)
-            for row in stream:
-                if row.get("lang", "").lower() == "python":
-                    yield row["content"]
-            continue
         cfg = STREAM_SOURCES[domain]
         stream = load_dataset(cfg["path"], name=cfg.get("name"), split="train", streaming=True)
         extractor = TEXT_EXTRACTORS[domain]

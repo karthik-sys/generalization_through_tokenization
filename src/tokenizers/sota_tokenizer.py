@@ -21,7 +21,12 @@ class SotaTokenizer:
         return self.enc.n_vocab
 
     def encode(self, text: str) -> list[int]:
-        return self.enc.encode(text, allowed_special=set())
+        # Web-scraped text sometimes literally contains "<|endoftext|>" or other
+        # special-token-shaped strings (e.g. quoted from someone else's LLM writeup).
+        # allowed_special=set() makes tiktoken raise on those instead of encoding them
+        # as ordinary text - disallowed_special=() treats every special-token-shaped
+        # string as plain text, which is what we want for arbitrary web content.
+        return self.enc.encode(text, disallowed_special=())
 
     def decode(self, ids: list[int]) -> str:
         return self.enc.decode(ids)
