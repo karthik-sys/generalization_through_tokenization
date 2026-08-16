@@ -1058,6 +1058,145 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
             "n_scored": n_scored, "n_skipped": n_skipped}
 
 
+@app.function(image=image, gpu="T4", volumes={VOLUME_PATH: volume}, timeout=900,
+              secrets=[modal.Secret.from_name("huggingface-token")])
+def generate(arm: str = "mot", checkpoint_step: int = 150000, seed_domain: str = "science",
+             max_new_tokens: int = 160, temperature: float = 0.8, n_samples: int = 3):
+    """Autoregressive sampling - the "does it actually produce text, and does routed actually
+    SWITCH domains" diagnostic. Not a demo: at 89M params on this corpus the text is
+    GPT-2-small-rough at best. The signal we're after is behavioral - for switching arms,
+    whether the model ever emits a "switch to domain k" token and changes register mid-stream
+    (switch-prediction accuracy being at chance says it can't PREDICT switches; this shows
+    whether it ever ACTS on the mechanism at all).
+
+    Decode: code/math/science BPE and baseline/sota decode cleanly. The nlp hybrid's
+    surface->syllable->morpheme->byte backoff is lossy, so nlp spans are shown as
+    "<nlp: N tokens>" rather than decoded to garbage. seed_domain defaults to science (clean
+    decode, and the domain that compresses best, so the least-incoherent starting point).
+    """
+    _setup_paths()
+    import os
+
+    os.chdir("/root/repo")
+    import torch
+    import torch.nn.functional as F
+
+    from src.data.build_examples import TokenizerBundle
+    from src.model.baseline_model import BaselineModel
+    from src.model.mot_hybrid_model import MoTHybridModel
+    from src.model.mot_model import MoTModel
+    from src.model.mot_pooled2_model import MoTPooled2Model
+    from src.model.mot_pooled_model import MoTPooledModel
+    from src.model.mot_routed_model import MoTRoutedModel
+    from src.model.stage2_config import BACKBONE_ONLY_CFG, CONFIDENCE_WEIGHT, FOCAL_GAMMA, MODEL_CFG
+
+    device = "cuda"
+    seq_len = MODEL_CFG["max_seq_len"]
+    bundle = TokenizerBundle(tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2")
+    ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{arm}_step{checkpoint_step}.pt", map_location=device)
+    domains = list(bundle.domain_vocab_sizes)
+    domain_index = {d: i for i, d in enumerate(domains)}
+    switching = arm in ("routed", "pooled", "hybrid", "pooled2", "routed2", "routed3")
+    domain_routed = arm == "mot" or switching
+
+    if arm == "mot":
+        model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "routed":
+        model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "pooled":
+        model = MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
+                               focal_gamma=FOCAL_GAMMA, confidence_weight=CONFIDENCE_WEIGHT).to(device)
+    elif arm in ("hybrid", "routed2", "routed3"):
+        model = MoTHybridModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "pooled2":
+        model = MoTPooled2Model(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
+                                focal_gamma=FOCAL_GAMMA).to(device)
+    elif arm == "baseline":
+        model = BaselineModel(vocab_size=bundle.baseline_vocab_size, **BACKBONE_ONLY_CFG).to(device)
+    else:
+        model = BaselineModel(vocab_size=bundle.sota_vocab_size, **BACKBONE_ONLY_CFG).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    print(f"loaded {arm} checkpoint at step {ckpt['step']}\n", flush=True)
+
+    def decode_span(domain, ids):
+        if domain == "nlp":
+            return f"⟨nlp:{len(ids)}tok⟩"
+        return bundle.bpe[domain].decode(ids)
+
+    for s in range(n_samples):
+        print(f"===== {arm} sample {s+1}/{n_samples} (seed domain: {seed_domain}) =====", flush=True)
+        torch.manual_seed(1000 + s)
+        if not domain_routed:
+            # baseline/sota: seed with the domain tag they trained on, then free-run
+            tag = f"<domain:{seed_domain}>\n"
+            enc = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
+            ids = enc(tag, max_len=10**9).tolist()
+            with torch.no_grad():
+                for _ in range(max_new_tokens):
+                    inp = torch.tensor(ids[-seq_len:], dtype=torch.long, device=device).unsqueeze(0)
+                    with torch.autocast("cuda"):
+                        logits = model(inp)[0, -1]
+                    probs = F.softmax(logits / temperature, dim=-1)
+                    ids.append(int(torch.multinomial(probs, 1)))
+            dec = bundle.baseline.decode(ids) if arm == "baseline" else bundle.sota.decode(ids)
+            print(dec.replace("\n", "\\n") + "\n", flush=True)
+            continue
+
+        # domain-routed: track (token, domain, is_control) as we go
+        cur = seed_domain
+        toks, doms, ctrls, typs = [], [], [], []
+        # seed with one control token establishing the domain
+        toks.append(domain_index[cur]); doms.append(domain_index[cur]); ctrls.append(1); typs.append(0)
+        switch_events = []
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                t_tok = torch.tensor(toks[-seq_len:], dtype=torch.long, device=device).unsqueeze(0)
+                t_dom = torch.tensor(doms[-seq_len:], dtype=torch.long, device=device).unsqueeze(0)
+                t_ctrl = torch.tensor(ctrls[-seq_len:], dtype=torch.long, device=device).unsqueeze(0)
+                t_typ = torch.tensor(typs[-seq_len:], dtype=torch.long, device=device).unsqueeze(0)
+                with torch.autocast("cuda"):
+                    if arm == "mot":
+                        logits = model(cur, t_tok, t_typ)[0, -1]
+                    else:
+                        out = model(t_tok, t_dom, t_ctrl, targets=None, type_ids=t_typ)
+                        logits = out[cur][1][-1]
+                probs = F.softmax(logits / temperature, dim=-1)
+                nxt = int(torch.multinomial(probs, 1))
+                vocab_d = bundle.domain_vocab_sizes[cur]
+                if arm != "mot" and nxt >= vocab_d:  # switch-to-domain-k token
+                    k = nxt - vocab_d
+                    if k < len(domains):
+                        new_dom = domains[k]
+                        switch_events.append((len(toks), cur, new_dom))
+                        cur = new_dom
+                        toks.append(domain_index[cur]); doms.append(domain_index[cur]); ctrls.append(1); typs.append(0)
+                        continue
+                    nxt = nxt % vocab_d  # out-of-range switch slot: clamp to a real token
+                toks.append(nxt); doms.append(domain_index[cur]); ctrls.append(0); typs.append(0)
+
+        # decode contiguous same-domain non-control spans
+        pieces, span_ids, span_dom = [], [], domains[doms[0]]
+        for tok, dom_i, ctrl in zip(toks, doms, ctrls):
+            dom = domains[dom_i]
+            if ctrl:
+                if span_ids:
+                    pieces.append(decode_span(span_dom, span_ids)); span_ids = []
+                pieces.append(f" 〔switch→{dom}〕 ")
+                span_dom = dom
+                continue
+            if dom != span_dom and span_ids:
+                pieces.append(decode_span(span_dom, span_ids)); span_ids = []
+            span_dom, _ = dom, span_ids.append(tok)
+        if span_ids:
+            pieces.append(decode_span(span_dom, span_ids))
+        print("".join(pieces).replace("\n", "\\n"), flush=True)
+        print(f"  [switches emitted: {len(switch_events)}]" +
+              (f" {switch_events}" if switch_events else " — stayed in seed domain the whole time") + "\n", flush=True)
+
+    return {"arm": arm, "switching": switching}
+
+
 @app.local_entrypoint()
 def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from: str = "", noisy: bool = False):
     """steps=0 means "use the default": 150 for calibrate, MAX_STEPS for train."""
@@ -1086,5 +1225,7 @@ def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from:
         print(f"\nLAMBADA for {arm}: accuracy={result['accuracy']:.4f}  "
               f"target-token ppl={result['target_token_ppl']:.2f}  "
               f"bits/target-token={result['bits_per_target_token']:.3f}")
+    elif step == "generate":
+        generate.remote(arm=arm, checkpoint_step=steps or 150000, seed_domain=resume_from or "science")
     else:
         raise ValueError(f"unknown step: {step}")
