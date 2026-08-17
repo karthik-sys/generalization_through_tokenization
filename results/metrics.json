@@ -45,7 +45,9 @@
     "arm": "pooled",
     "bpb_cross": 2.135,
     "bpb_single": 2.3836,
-    "note": "FINAL - plateau confirmed: 68k more steps moved BPB by 0.013",
+    "lambada_accuracy": 0.0,
+    "lambada_ppl": 280.52,
+    "note": "FINAL - plateau confirmed: 68k more steps moved BPB by 0.013. LAMBADA ppl=280.52 - beats unified-BPE baseline/SOTA by a wide margin but well behind routed (47.76) and mot (148.4).",
     "params": 98720785,
     "per_domain_bpb": {
       "code": 2.2426,
