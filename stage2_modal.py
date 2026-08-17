@@ -650,11 +650,21 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
         from src.data.stage2_stream_dataset import TEXT_EXTRACTORS
 
         cfg = STREAM_SOURCES[domain]
+        # PG-19 (routed9/routed10's nlp source) has only ~28.6k rows total, each a whole book -
+        # SKIP_DOCS=300k (sized for the other, million-row sources) would force the streamer to
+        # download and discard the ENTIRE corpus before ever yielding a row, which is exactly
+        # what hung real evaluate() calls for tens of minutes (confirmed: an isolated
+        # load_dataset+next() test on pg19 alone returns in under 10s - the hang was this skip,
+        # not the dataset load). A small skip is just as "held-out" as a large one here anyway -
+        # a corpus this size gets fully cycled by training many times over by step 20k+,
+        # so no skip count restores a clean split; it only needs to not be larger than the
+        # dataset.
+        skip_docs = 500 if cfg["path"] == "deepmind/pg19" else SKIP_DOCS
         stream = load_dataset(
             cfg["path"], name=cfg.get("name"), revision=cfg.get("revision"),
             data_files=cfg.get("data_files"), split="train", streaming=True,
             trust_remote_code=True,
-        ).skip(SKIP_DOCS)
+        ).skip(skip_docs)
         extractor = TEXT_EXTRACTORS[domain]
         for row in stream:
             text = extractor(row)
