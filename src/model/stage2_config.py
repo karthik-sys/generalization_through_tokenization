@@ -138,6 +138,9 @@ ARM_LABELS = {
     "routed4": "Routed + LEARNED switch weight (Kendall uncertainty weighting, starts at 50, standard loss - no GradNorm)",
     "routed5": "Routed + gradient-decoupled switch head (separate classifier, detached from backbone; switch_weight=50 fixed)",
     "routed6": "Routed + 2x context (1024->2048), otherwise unchanged",
+    "routed7": "Routed, LARGE scale, nlp domain sourced from OpenWebTextCorpus instead of FineWeb "
+               "(code/math/science unchanged) - closes the data-source gap vs GPT-2 for the domain "
+               "LAMBADA actually routes through",
 }
 
 # arm="hybrid" only: fraction of training steps drawing a natural single-domain batch

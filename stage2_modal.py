@@ -596,6 +596,13 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     device = "cuda"
     if arm == "routed4":
         MODEL_CFG = LONGCTX_MODEL_CFG  # routed4 is always 2x context, regardless of --scale
+    elif arm == "routed7":
+        MODEL_CFG = LARGE_MODEL_CFG  # routed7 is always large-scale, regardless of --scale
+        scale = "large"
+        # held-out eval must read from the SAME distribution routed7 trained on, or this
+        # scores it against text it never saw (see _apply_openwebtext_nlp_source in
+        # train_stage2_pod.py for the full rationale - code/math/science untouched).
+        STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
     elif scale == "large":
         MODEL_CFG = LARGE_MODEL_CFG
     BACKBONE_ONLY_CFG = LARGE_BACKBONE_ONLY_CFG if scale == "large" else BACKBONE_ONLY_CFG
@@ -766,10 +773,10 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
-    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4")  # arms with disjoint per-domain heads
+    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4", "routed7")  # arms with disjoint per-domain heads
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    elif arm == "routed":
+    elif arm in ("routed", "routed7"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "pooled":
         model = MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
@@ -996,6 +1003,11 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     device = "cuda"
     if arm == "routed4":
         MODEL_CFG = LONGCTX_MODEL_CFG  # routed4 is always 2x context, regardless of --scale
+    elif arm == "routed7":
+        MODEL_CFG = LARGE_MODEL_CFG  # routed7 is always large-scale, regardless of --scale
+        scale = "large"
+        # (no STREAM_SOURCES override needed here, unlike evaluate() - LAMBADA always reads
+        # from the fixed EleutherAI/lambada_openai benchmark, never from STREAM_SOURCES)
     elif scale == "large":
         MODEL_CFG = LARGE_MODEL_CFG
     BACKBONE_ONLY_CFG = LARGE_BACKBONE_ONLY_CFG if scale == "large" else BACKBONE_ONLY_CFG
@@ -1005,10 +1017,10 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
-    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4")
+    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4", "routed7")
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    elif arm == "routed":
+    elif arm in ("routed", "routed7"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "pooled":
         model = MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
