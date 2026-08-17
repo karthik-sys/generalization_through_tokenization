@@ -586,14 +586,18 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     from src.model.mot_model import MoTModel
     from src.model.mot_pooled2_model import MoTPooled2Model
     from src.model.mot_pooled_model import MoTPooledModel
+    from src.model.mot_routed_combined_model import MoTRoutedCombinedModel
     from src.model.mot_routed_model import MoTRoutedModel
     from src.model.stage2_config import (
         BACKBONE_ONLY_CFG, BATCH_SIZE, CONFIDENCE_WEIGHT, FOCAL_GAMMA, LARGE_BACKBONE_ONLY_CFG,
-        LARGE_MODEL_CFG, MODEL_CFG, STREAM_SOURCES,
+        LARGE_MODEL_CFG, LONGCTX_MODEL_CFG, MODEL_CFG, STREAM_SOURCES,
     )
 
     device = "cuda"
-    MODEL_CFG = LARGE_MODEL_CFG if scale == "large" else MODEL_CFG
+    if arm == "routed4":
+        MODEL_CFG = LONGCTX_MODEL_CFG  # routed4 is always 2x context, regardless of --scale
+    elif scale == "large":
+        MODEL_CFG = LARGE_MODEL_CFG
     BACKBONE_ONLY_CFG = LARGE_BACKBONE_ONLY_CFG if scale == "large" else BACKBONE_ONLY_CFG
     ckpt_prefix = f"large_{arm}" if scale == "large" else arm
     SKIP_DOCS = 300_000  # well past what 20k-200k training steps could consume from million-row sources
@@ -762,7 +766,7 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
-    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3")  # arms with disjoint per-domain heads
+    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4")  # arms with disjoint per-domain heads
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "routed":
@@ -775,6 +779,8 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     elif arm == "pooled2":
         model = MoTPooled2Model(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
                                 focal_gamma=FOCAL_GAMMA).to(device)
+    elif arm == "routed4":
+        model = MoTRoutedCombinedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "baseline":
         model = BaselineModel(vocab_size=bundle.baseline_vocab_size, **BACKBONE_ONLY_CFG).to(device)
     else:
@@ -980,14 +986,18 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     from src.model.mot_model import MoTModel
     from src.model.mot_pooled2_model import MoTPooled2Model
     from src.model.mot_pooled_model import MoTPooledModel
+    from src.model.mot_routed_combined_model import MoTRoutedCombinedModel
     from src.model.mot_routed_model import MoTRoutedModel
     from src.model.stage2_config import (
         BACKBONE_ONLY_CFG, CONFIDENCE_WEIGHT, FOCAL_GAMMA, LARGE_BACKBONE_ONLY_CFG, LARGE_MODEL_CFG,
-        MODEL_CFG,
+        LONGCTX_MODEL_CFG, MODEL_CFG,
     )
 
     device = "cuda"
-    MODEL_CFG = LARGE_MODEL_CFG if scale == "large" else MODEL_CFG
+    if arm == "routed4":
+        MODEL_CFG = LONGCTX_MODEL_CFG  # routed4 is always 2x context, regardless of --scale
+    elif scale == "large":
+        MODEL_CFG = LARGE_MODEL_CFG
     BACKBONE_ONLY_CFG = LARGE_BACKBONE_ONLY_CFG if scale == "large" else BACKBONE_ONLY_CFG
     ckpt_prefix = f"large_{arm}" if scale == "large" else arm
     seq_len = MODEL_CFG["max_seq_len"]
@@ -995,7 +1005,7 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
-    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3")
+    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4")
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "routed":
@@ -1010,6 +1020,8 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
                                 focal_gamma=FOCAL_GAMMA).to(device)
     elif arm in ("routed2", "routed3"):
         model = MoTHybridModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "routed4":
+        model = MoTRoutedCombinedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "baseline":
         model = BaselineModel(vocab_size=bundle.baseline_vocab_size, **BACKBONE_ONLY_CFG).to(device)
     else:
