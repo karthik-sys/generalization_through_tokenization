@@ -49,13 +49,14 @@ before starting training, no separate machine needed:
 cd /workspace/repo && python3 scripts/retrain_nlp_tokenizer_openwebtext.py
 ```
 
-Takes a few minutes (sampling 50k docs from OpenWebText, then fitting three tokenizer tiers:
-surface via SentencePiece, syllable via pyphen, morpheme via Morfessor — Morfessor is the
-slow one). Verified locally with a real smoke run (300 docs, not the full 50k): surface and
-syllable tiers trained cleanly with real output files in a few minutes, confirming the code
-path itself is correct. The full 50k-doc run wasn't waited on locally — running it here on
-the pod, right before training, is the actual intended path, not something that depends on
-any file generated elsewhere.
+Takes a few minutes at smoke scale, longer at the full 50k (sampling from OpenWebText, then
+fitting three tokenizer tiers: surface via SentencePiece, syllable via pyphen, morpheme via
+Morfessor). Verified locally end-to-end with a real smoke run (300 docs, not the full 50k):
+all three tiers completed successfully, real output files for each (`surface.model`,
+`surface.vocab`, `syllable_vocab.json`, `morpheme_vocab.json`, `morfessor.bin`), clean exit
+code. The full 50k-doc run wasn't waited on locally (a 250MB+ input corpus at that scale, a
+meaningfully longer fit) — running it here on the pod, right before training, is the actual
+intended path, not something that depends on any file generated elsewhere.
 
 When it finishes you should have:
 
