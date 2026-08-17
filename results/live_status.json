@@ -1,10 +1,10 @@
 {
-  "updated": "2026-08-17T17:20Z",
+  "updated": "2026-08-17T17:35Z",
   "in_flight": [
     {
       "arm": "routed8",
       "base": "Routed",
-      "step": 59450,
+      "step": 72450,
       "total": 600000,
       "state": "running",
       "tests": "4x-Data-Volume - nlp OWT-sourced, 600k steps (matches llm.c's ~10B-token/domain budget)"
@@ -12,18 +12,18 @@
     {
       "arm": "routed9",
       "base": "Routed",
-      "step": 0,
-      "total": 50000,
-      "state": "pending",
-      "tests": "Books+Warmstart-89M - blocked on the PG-19 nlp tokenizer (SentencePiece fit was stalling on full-length books, fixed by capping the fitting sample to 30k chars/doc)"
+      "step": 1150,
+      "total": 150000,
+      "state": "running",
+      "tests": "Books+Warmstart-89M - warm-started from champion, PG-19 books, ~55% nlp mixture. Retargeted from the original 50k-step cooldown to 150k (a full run's length) after resuming cleanly from its step-1000 checkpoint - no progress lost, but this is no longer the cheap short cooldown originally planned"
     },
     {
       "arm": "routed10-large",
       "base": "Routed7",
-      "step": 0,
+      "step": 600,
       "total": 50000,
-      "state": "pending",
-      "tests": "Books+Warmstart-190M - blocked on the same PG-19 tokenizer as routed9"
+      "state": "running",
+      "tests": "Books+Warmstart-190M - warm-started from routed7, PG-19 books, ~55% nlp mixture, still on the original 50k cooldown target"
     }
   ]
 }
