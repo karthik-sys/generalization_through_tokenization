@@ -1,0 +1,110 @@
+{
+  "baseline@150000": {
+    "arm": "baseline",
+    "bpb_single": 2.0049,
+    "lambada_accuracy": 0.0,
+    "lambada_ppl": 7785.58,
+    "note": "unified 48k BPE; collapses on LAMBADA",
+    "params": 68639616,
+    "scale": "base",
+    "step": 150000
+  },
+  "hybrid@75000": {
+    "arm": "hybrid",
+    "bpb_cross": 2.8414,
+    "bpb_single": 2.535,
+    "note": "GradNorm fixed switch acc (27->35%) but lost cross-domain edge; 75k not matched",
+    "params": 89114364,
+    "per_domain_bpb": {
+      "code": 2.742,
+      "math": 2.9549,
+      "nlp": 2.5473,
+      "science": 2.0243
+    },
+    "scale": "base",
+    "step": 75000,
+    "switch_accuracy": 0.3485
+  },
+  "mot@150000": {
+    "arm": "mot",
+    "bpb_single": 1.9089,
+    "lambada_accuracy": 0.0,
+    "lambada_ppl": 148.44,
+    "note": "matched-150k thesis control",
+    "params": 89104108,
+    "per_domain_bpb": {
+      "code": 2.7114,
+      "math": 1.9082,
+      "nlp": 1.8291,
+      "science": 1.3162
+    },
+    "scale": "base",
+    "step": 150000
+  },
+  "pooled@150000": {
+    "arm": "pooled",
+    "bpb_cross": 2.135,
+    "bpb_single": 2.3836,
+    "note": "FINAL - plateau confirmed: 68k more steps moved BPB by 0.013",
+    "params": 98720785,
+    "per_domain_bpb": {
+      "code": 2.2426,
+      "math": 2.6698,
+      "nlp": 2.5026,
+      "science": 2.1869
+    },
+    "scale": "base",
+    "step": 150000,
+    "switch_accuracy": 0.2744
+  },
+  "pooled@82000": {
+    "arm": "pooled",
+    "bpb_cross": 2.166,
+    "bpb_single": 2.397,
+    "lambada_ppl": 282.8,
+    "note": "earlier checkpoint",
+    "params": 98720785,
+    "scale": "base",
+    "step": 82000,
+    "switch_accuracy": 0.2595
+  },
+  "routed@100000": {
+    "arm": "routed",
+    "bpb_cross": 1.589,
+    "bpb_single": 2.057,
+    "lambada_ppl": 54.89,
+    "note": "earlier checkpoint",
+    "params": 89114364,
+    "scale": "base",
+    "step": 100000,
+    "switch_accuracy": 0.2707
+  },
+  "routed@150000": {
+    "arm": "routed",
+    "bpb_cross": 1.5437,
+    "bpb_single": 2.0751,
+    "lambada_accuracy": 0.004,
+    "lambada_ppl": 47.76,
+    "note": "CHAMPION - best LAMBADA + cross-domain of any arm; improved from 100k",
+    "params": 89114364,
+    "per_domain_bpb": {
+      "code": 1.5018,
+      "math": 2.4804,
+      "nlp": 2.3283,
+      "science": 2.0399
+    },
+    "scale": "base",
+    "step": 150000,
+    "switch_accuracy": 0.2583
+  },
+  "sota@123000": {
+    "arm": "sota",
+    "bpb_single": 2.1317,
+    "lambada_accuracy": 0.0,
+    "lambada_ppl": 72148.52,
+    "note": "cl100k 100k vocab; worst LAMBADA - vocab is a liability at this scale",
+    "params": 122223541,
+    "scale": "base",
+    "step": 123000
+  }
+}

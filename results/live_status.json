@@ -1,0 +1,11 @@
+{
+  "updated": "2026-08-17T00:10Z",
+  "in_flight": [
+    {"arm":"hybrid","step":114950,"total":150000,"tests":"Routed + GradNorm switch-loss + 60% natural-data blend"},
+    {"arm":"pooled2","step":92950,"total":150000,"tests":"Pooled + GradNorm + sparse top-2/16 routing + no confidence head"},
+    {"arm":"routed2","step":66250,"total":150000,"tests":"Routed + GradNorm loss ONLY (isolates the loss fix)"},
+    {"arm":"routed3","step":64000,"total":150000,"tests":"Routed + GradNorm + 2.4x denser cross-domain data"},
+    {"arm":"routed-large","step":3700,"total":150000,"tests":"SCALE TEST: routed at 190M params (2.1x) - does the champion's edge survive scale"},
+    {"arm":"baseline-large","step":3500,"total":150000,"tests":"SCALE TEST: unified-BPE control at 160M params"}
+  ]
+}
