@@ -649,6 +649,7 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
         stream = load_dataset(
             cfg["path"], name=cfg.get("name"), revision=cfg.get("revision"),
             data_files=cfg.get("data_files"), split="train", streaming=True,
+            trust_remote_code=True,
         ).skip(SKIP_DOCS)
         extractor = TEXT_EXTRACTORS[domain]
         for row in stream:
