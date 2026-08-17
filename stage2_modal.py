@@ -557,7 +557,7 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
     return history
 
 
-@app.function(image=image, gpu="T4", volumes={VOLUME_PATH: volume}, timeout=1800,
+@app.function(image=image, gpu="T4", volumes={VOLUME_PATH: volume}, timeout=5400,
               secrets=[modal.Secret.from_name("huggingface-token")])
 def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int = 200, noisy: bool = False, scale: str = "base"):
     """Held-out eval against a saved checkpoint. train()'s streams all start from the
