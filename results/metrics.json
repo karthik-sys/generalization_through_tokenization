@@ -1,4 +1,14 @@
 {
+  "baseline-large@116000": {
+    "arm": "baseline",
+    "bpb_single": 1.3838,
+    "lambada_accuracy": 0.008,
+    "lambada_ppl": 982.46,
+    "note": "SCALE TEST snapshot, 77% through (116k/150k) - NOT final, but first-ever baseline-large eval. Wins single-domain BPB decisively over routed-large (1.384 vs 1.872), the gap WIDER than at small scale. Still collapses hard on LAMBADA (982.46) vs routed-large (32.39), a 30x gap even with far more training than routed-large has had so far.",
+    "params": 159600000,
+    "scale": "large",
+    "step": 116000
+  },
   "baseline@150000": {
     "arm": "baseline",
     "bpb_single": 2.0049,
@@ -144,6 +154,24 @@
     "step": 52000,
     "switch_accuracy": 0.2736
   },
+  "routed-large@63000": {
+    "arm": "routed",
+    "bpb_cross": 1.3535,
+    "bpb_single": 1.8722,
+    "lambada_accuracy": 0.026,
+    "lambada_ppl": 32.39,
+    "note": "SCALE TEST snapshot, 42% through (63k/150k) - NOT final. First real head-to-head vs baseline-large (@116k, 77% done): baseline-large wins single-domain BPB decisively (1.384 vs 1.872 - a WIDER gap than at small scale, 26% vs 3.5%), but routed-large wins LAMBADA by 30x (32.39 vs 982.46) despite baseline having much more training. Scale appears to sharpen the compression/generalization trade-off in both directions, not resolve it in routed favor outright.",
+    "params": 190481644,
+    "per_domain_bpb": {
+      "code": 1.2226,
+      "math": 2.1004,
+      "nlp": 2.1739,
+      "science": 2.0066
+    },
+    "scale": "large",
+    "step": 63000,
+    "switch_accuracy": 0.2752
+  },
   "routed2@150000": {
     "arm": "routed2",
     "bpb_cross": 2.8226,
@@ -179,6 +207,14 @@
     "scale": "base",
     "step": 150000,
     "switch_accuracy": 0.3547
+  },
+  "routed4@10000": {
+    "arm": "routed4",
+    "lambada_accuracy": 0.0,
+    "lambada_ppl": 310.53,
+    "note": "First snapshot, only 6.9% through training (10k/150k) - too early to read into. Decoupled switch head + learned Kendall switch-weight + 2x context, standard CE loss (no GradNorm). LAMBADA ppl=310.53.",
+    "scale": "base",
+    "step": 10000
   },
   "routed@100000": {
     "arm": "routed",
@@ -218,5 +254,15 @@
     "params": 122223541,
     "scale": "base",
     "step": 123000
+  },
+  "sota@150000": {
+    "arm": "sota",
+    "bpb_single": 2.1071,
+    "lambada_accuracy": 0.0,
+    "lambada_ppl": 66681.21,
+    "note": "Matched to 150k (was 123k, undertrained). Confirms it was NOT primarily a training-shortfall artifact: BPB 2.132->2.107, LAMBADA 72149->66681, both barely moved with the extra 27k steps. cl100k 100k vocab is a real, robust liability at this scale, not an incomplete-run artifact.",
+    "params": 122223541,
+    "scale": "base",
+    "step": 150000
   }
 }
