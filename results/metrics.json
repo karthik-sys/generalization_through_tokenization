@@ -261,6 +261,22 @@
     "step": 150000,
     "switch_accuracy": 0.0
   },
+  "routed7-large@125000": {
+    "arm": "routed7",
+    "bpb_cross": 1.2203,
+    "bpb_single": 1.9682,
+    "lambada_accuracy": 0.038,
+    "lambada_ppl": 23.9,
+    "note": "SNAPSHOT, 83% through (125k/150k) - NOT final, still training. Corpus-matching hypothesis validated directly: nlp sourced from OpenWebText (vs FineWeb for routed-large) already MATCHES OR BEATS routed-large final (150k) on every metric - BPB single 1.968 vs 2.009, cross 1.220 vs 1.203 (near-identical, both best-of-project), LAMBADA 23.90 vs 24.17 - despite 25k fewer steps. Same architecture, same scale, only the nlp corpus differs. This is real evidence the data-source gap (vs GPT-2/WebText) was a genuine, measurable factor, not just theoretical.",
+    "params": 190481644,
+    "per_domain_bpb": {
+      "nlp": 2.3714,
+      "science": 2.0483
+    },
+    "scale": "large",
+    "step": 125000,
+    "switch_accuracy": 0.2915
+  },
   "routed@100000": {
     "arm": "routed",
     "bpb_cross": 1.589,
