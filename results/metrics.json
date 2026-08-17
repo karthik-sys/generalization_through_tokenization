@@ -200,6 +200,24 @@
     "step": 63000,
     "switch_accuracy": 0.2752
   },
+  "routed10-large@20000": {
+    "arm": "routed10",
+    "bpb_cross": 1.2516,
+    "bpb_single": 1.9347,
+    "lambada_accuracy": 0.012,
+    "lambada_ppl": 59.59,
+    "note": "SNAPSHOT, 20k/50k (40%) into the warm-started cooldown from routed7. nlp branch reinitialized at warm-start, same as routed9 - recovering, but already tracking well ahead of routed9 at a comparable fraction of its (shorter) target: LAMBADA ppl 59.6 vs routed9's 155.4, cross-domain BPB 1.252 vs routed9's 1.532. Consistent with warm-starting from routed7 (already OpenWebText-adapted) rather than the plain champion, plus a shorter, more front-loaded cooldown. Re-check near 50k for the real comparison point against routed7's own final numbers (ppl 23.92).",
+    "params": 190481644,
+    "per_domain_bpb": {
+      "code": 1.2098,
+      "math": 2.3854,
+      "nlp": 1.992,
+      "science": 2.122
+    },
+    "scale": "large",
+    "step": 20000,
+    "switch_accuracy": 0.2191
+  },
   "routed2@150000": {
     "arm": "routed2",
     "bpb_cross": 2.8226,
@@ -294,6 +312,24 @@
     "scale": "large",
     "step": 150000,
     "switch_accuracy": 0.2959
+  },
+  "routed9@24000": {
+    "arm": "routed9",
+    "bpb_cross": 1.5319,
+    "bpb_single": 2.0539,
+    "lambada_accuracy": 0.0,
+    "lambada_ppl": 155.42,
+    "note": "SNAPSHOT, 24k/150k (16%) into the warm-started cooldown. nlp branch (embedding+head) was reinitialized at warm-start - LAMBADA (155.4 ppl, 0% EM) and nlp-domain BPB (2.00, worse than champion routed's eventual settled numbers) both reflect that recovery, not a failure of the books/upweight approach itself. Backbone + code/math/science warm-started cleanly from the champion checkpoint (their BPB - code 1.59, math 2.56, science 2.05 - already close to champion-scale norms this early, consistent with the 0.1x LR cooldown protecting what was already learned). Re-check once further into the 150k run.",
+    "params": 89114364,
+    "per_domain_bpb": {
+      "code": 1.5931,
+      "math": 2.5619,
+      "nlp": 2.0043,
+      "science": 2.0544
+    },
+    "scale": "base",
+    "step": 24000,
+    "switch_accuracy": 0.2066
   },
   "routed@100000": {
     "arm": "routed",

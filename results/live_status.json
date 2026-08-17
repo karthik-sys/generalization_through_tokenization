@@ -1,29 +1,29 @@
 {
-  "updated": "2026-08-17T17:35Z",
+  "updated": "2026-08-17T22:10Z",
   "in_flight": [
     {
       "arm": "routed8",
       "base": "Routed",
-      "step": 72450,
+      "step": 288100,
       "total": 600000,
       "state": "running",
-      "tests": "4x-Data-Volume - nlp OWT-sourced, 600k steps (matches llm.c's ~10B-token/domain budget)"
+      "tests": "4x-Data-Volume - nlp OWT-sourced, 600k steps (matches llm.c's ~10B-token/domain budget). Checkpoint eval @198k: LAMBADA ppl 23.84, exact-match 3.60%"
     },
     {
       "arm": "routed9",
       "base": "Routed",
-      "step": 1150,
-      "total": 150000,
+      "step": 44650,
+      "total": 50000,
       "state": "running",
-      "tests": "Books+Warmstart-89M - warm-started from champion, PG-19 books, ~55% nlp mixture. Retargeted from the original 50k-step cooldown to 150k (a full run's length) after resuming cleanly from its step-1000 checkpoint - no progress lost, but this is no longer the cheap short cooldown originally planned"
+      "tests": "Books+Warmstart-89M - warm-started from champion, PG-19 books, ~55% nlp mixture. Checkpoint eval @24k: LAMBADA ppl 155.4 (nlp branch still recovering from warm-start reinit), cross-domain BPB 1.532"
     },
     {
       "arm": "routed10-large",
       "base": "Routed7",
-      "step": 600,
+      "step": 36400,
       "total": 50000,
       "state": "running",
-      "tests": "Books+Warmstart-190M - warm-started from routed7, PG-19 books, ~55% nlp mixture, still on the original 50k cooldown target"
+      "tests": "Books+Warmstart-190M - warm-started from routed7, PG-19 books, ~55% nlp mixture. Checkpoint eval @20k: LAMBADA ppl 59.6, cross-domain BPB 1.252 - recovering faster than routed9 at a comparable fraction of its run"
     }
   ]
 }
