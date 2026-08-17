@@ -68,6 +68,24 @@
     "step": 82000,
     "switch_accuracy": 0.2595
   },
+  "routed3@150000": {
+    "arm": "routed3",
+    "bpb_cross": 3.2019,
+    "bpb_single": 3.6731,
+    "lambada_accuracy": 0.0,
+    "lambada_ppl": 3198.62,
+    "note": "GradNorm + 2.4x denser cross-domain data. Switch acc improved (35% vs routed champion 26%) but BPB nearly doubled and LAMBADA collapsed (3199 vs 48) - the denser data variant badly hurt LM quality despite the switch-prediction gain.",
+    "params": 89100000,
+    "per_domain_bpb": {
+      "code": 3.6319,
+      "math": 3.8872,
+      "nlp": 4.0254,
+      "science": 3.2922
+    },
+    "scale": "base",
+    "step": 150000,
+    "switch_accuracy": 0.3547
+  },
   "routed@100000": {
     "arm": "routed",
     "bpb_cross": 1.589,

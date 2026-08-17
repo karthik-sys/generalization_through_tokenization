@@ -18,14 +18,6 @@
       "tests": "SCALE TEST - 190M (2.1x): does the champion survive scale"
     },
     {
-      "arm": "routed3",
-      "base": "Routed",
-      "step": 150000,
-      "total": 150000,
-      "state": "stopped",
-      "tests": "+ GradNorm + 2.4x denser cross-domain data - process stopped, eval-ready or restart"
-    },
-    {
       "arm": "hybrid",
       "base": "Routed",
       "step": 144000,
