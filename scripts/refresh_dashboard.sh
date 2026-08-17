@@ -97,6 +97,18 @@ try:
 except FileNotFoundError:
     loss_curves = {}
 
+try:
+    # arms already scored into the evaluated-arms store, keyed "arm@step" (see src/eval/metrics.py).
+    # An arm's pod can still be sitting there idle post-eval (we don't auto-terminate them), which
+    # would otherwise make it reappear in the in-flight table forever even though it already has a
+    # scoreboard row - so once an arm is evaluated at >= the step we're seeing, drop it from in-flight.
+    evaluated = {}
+    for key, row in json.load(open("results/metrics.json")).items():
+        a = row["arm"] + ("-large" if row.get("scale") == "large" else "")
+        evaluated[a] = max(evaluated.get(a, 0), row["step"])
+except FileNotFoundError:
+    evaluated = {}
+
 seen = {}
 for ep in sys.argv[1:]:
     host, port = ep.rsplit(":", 1)
@@ -127,13 +139,22 @@ for ep in sys.argv[1:]:
     if alive and arm in prev and step < prev[arm]:
         print(f"  ! {ep}: {arm} read step {step} < previous {prev[arm]}, keeping previous (stale/corrupt read)", file=sys.stderr)
         step = prev[arm]
+    if not alive and arm in evaluated and step <= evaluated[arm]:
+        print(f"  = {ep}: {arm} already evaluated at step {evaluated[arm]} (this reading: {step}), "
+              f"leaving out of in-flight", file=sys.stderr)
+        continue
     base, tests = META.get(arm, ("?", ""))
     # keep the furthest-along sighting if an arm appears on two endpoints
     if arm in seen and seen[arm]["step"] >= step:
         continue
+    if alive:
+        state, suffix = "running", ""
+    elif step >= TOTAL:
+        state, suffix = "done", " - finished cleanly, checkpoint saved, awaiting eval"
+    else:
+        state, suffix = "stopped", " - process stopped, eval-ready or restart"
     seen[arm] = {"arm": arm, "base": base, "step": step, "total": TOTAL,
-                 "state": "running" if alive else "stopped",
-                 "tests": tests + ("" if alive else " - process stopped, eval-ready or restart")}
+                 "state": state, "tests": tests + suffix}
 
 # Carry forward arms this cycle's endpoints didn't cover at all (e.g. a pod that fully
 # terminated, so there's no SSH endpoint left to sweep) - a pod going away entirely is not
