@@ -37,13 +37,21 @@ def load_tagged_docs(path: str) -> list[tuple[str, str]]:
 
 
 class TokenizerBundle:
-    def __init__(self, tokenizer_dir: str = "tokenizers"):
+    def __init__(self, tokenizer_dir: str = "tokenizers", nlp_tokenizer_dir: str | None = None):
+        """nlp_tokenizer_dir overrides where the nlp tokenizer loads from, independent of
+        tokenizer_dir (which still governs code/math/science/baseline/sota). Exists for
+        arm="routed7": its nlp domain trains on a different corpus (OpenWebText, not
+        FineWeb) and needs its OWN nlp tokenizer fit to that corpus - code/math/science
+        keep using the shared, unmodified tokenizers under tokenizer_dir. Without this,
+        there'd be no way to mix "most domains from the shared bundle, one domain from a
+        separately-trained tokenizer" without either retraining everything or physically
+        duplicating the untouched tokenizer files."""
         self.bpe = {
             "code": BPETokenizer(f"{tokenizer_dir}/code/model.model"),
             "math": BPETokenizer(f"{tokenizer_dir}/math/model.model"),
             "science": BPETokenizer(f"{tokenizer_dir}/science/model.model"),
         }
-        self.nlp = NLPHybridTokenizer(f"{tokenizer_dir}/nlp")
+        self.nlp = NLPHybridTokenizer(nlp_tokenizer_dir or f"{tokenizer_dir}/nlp")
         self.baseline = BPETokenizer(f"{tokenizer_dir}/baseline_bpe/model.model")
         self.sota = SotaTokenizer("cl100k_base")
 

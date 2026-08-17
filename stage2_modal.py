@@ -769,7 +769,10 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
                         yield torch.tensor(buf[: self.seq_len + 1], dtype=torch.long)
                         buf = buf[self.seq_len + 1:]
 
-    bundle = TokenizerBundle(tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2")
+    bundle = TokenizerBundle(
+        tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
+        nlp_tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp" if arm == "routed7" else None,
+    )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
@@ -1013,7 +1016,10 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     BACKBONE_ONLY_CFG = LARGE_BACKBONE_ONLY_CFG if scale == "large" else BACKBONE_ONLY_CFG
     ckpt_prefix = f"large_{arm}" if scale == "large" else arm
     seq_len = MODEL_CFG["max_seq_len"]
-    bundle = TokenizerBundle(tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2")
+    bundle = TokenizerBundle(
+        tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
+        nlp_tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp" if arm == "routed7" else None,
+    )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}

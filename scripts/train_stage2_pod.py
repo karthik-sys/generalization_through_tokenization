@@ -43,6 +43,10 @@ from src.model.stage2_config import (
 )
 
 TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2")
+# arm="routed7" only: nlp tokenizer retrained on OpenWebText (see
+# scripts/retrain_nlp_tokenizer_openwebtext.py) - must exist before routed7 can run.
+# code/math/science still load from TOKENIZER_DIR above, unchanged.
+OWT_NLP_TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2_owt" / "nlp")
 CKPT_DIR = REPO_ROOT / "checkpoints"
 
 
@@ -154,7 +158,8 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
         scale = "large"  # always large-scale, regardless of what --scale was passed
         _apply_openwebtext_nlp_source()
 
-    bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR)
+    bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR,
+                              nlp_tokenizer_dir=OWT_NLP_TOKENIZER_DIR if arm == "routed7" else None)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     model = _build_model(arm, bundle, device, scale)
     print(f"{arm} ({scale}) params: {model.num_params():,}", flush=True)
@@ -243,7 +248,8 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         scale = "large"  # always large-scale, regardless of what --scale was passed
         _apply_openwebtext_nlp_source()
 
-    bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR)
+    bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR,
+                              nlp_tokenizer_dir=OWT_NLP_TOKENIZER_DIR if arm == "routed7" else None)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     model = _build_model(arm, bundle, device, scale)
     print(f"{arm} ({scale}) params: {model.num_params():,}", flush=True)
