@@ -29,7 +29,7 @@ def sample_domain(domain: str, out_dir: str = "data/stage2_tokenizer_sample", n_
     stream = load_dataset(
         cfg["path"], name=cfg.get("name"), data_dir=cfg.get("data_dir"),
         revision=cfg.get("revision"), data_files=cfg.get("data_files"),
-        split="train", streaming=True,
+        split="train", streaming=True, trust_remote_code=True,
     )
     rows = []
     for row in itertools.islice(stream, n_docs):

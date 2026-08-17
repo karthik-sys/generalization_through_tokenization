@@ -1,4 +1,9 @@
-datasets>=2.19
+datasets==2.19.0  # pinned exact: deepmind/pg19 (routed9/routed10) only loads via a legacy HF
+                  # "dataset script" (pg19.py, no Parquet mirror exists) - datasets>=~2.20
+                  # removed script-loading support outright ("Dataset scripts are no longer
+                  # supported"), confirmed against a real pod (5.0.1 fails, 2.19.0 + the
+                  # trust_remote_code=True now passed in stage2_routed_stream.py/
+                  # stage2_sample_for_tokenizers.py loads real book text cleanly)
 tokenizers>=0.19
 sentencepiece>=0.2
 morfessor>=2.0

@@ -44,6 +44,7 @@ def _raw_body_stream(domain: str) -> Iterator[str]:
         stream = load_dataset(
             cfg["path"], name=cfg.get("name"), revision=cfg.get("revision"),
             data_files=cfg.get("data_files"), split="train", streaming=True,
+            trust_remote_code=True,
         )
         extractor = TEXT_EXTRACTORS[domain]
         for row in stream:
