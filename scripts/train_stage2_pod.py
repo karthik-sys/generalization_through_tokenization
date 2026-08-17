@@ -77,9 +77,10 @@ def _hybrid_batch(step: int, domains: list[str], domain_index: dict[str, int],
 
 
 def _apply_openwebtext_nlp_source() -> None:
-    """arm="routed7" only: re-point the shared nlp domain to OpenWebTextCorpus (the standard
-    open reconstruction of GPT-2's unreleased WebText - see docs/handoff_routed7.md) instead
-    of FineWeb. code/math/science stay on their existing rich sources unchanged - OpenWebText
+    """arm in ("routed7", "routed8"): re-point the shared nlp domain to OpenWebTextCorpus (the
+    standard open reconstruction of GPT-2's unreleased WebText - see docs/handoff_routed7.md and
+    docs/handoff_data_equivalent_runs.md) instead of FineWeb. code/math/science stay on their
+    existing rich sources unchanged - OpenWebText
     was measured to contain almost no dense code/math/science content (code ~1-in-185 docs,
     math and science ~1-in-1250 each, over a real 5000-doc sample), so forcing those three
     domains out of it would starve their streams. nlp is the only domain LAMBADA is even
@@ -122,7 +123,9 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
         raise ValueError(f"scale=large supports mot/baseline/routed/routed3/routed7, not {arm}")
     if arm == "mot":
         return MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    if arm == "routed":
+    if arm in ("routed", "routed8"):
+        # routed8: identical architecture to plain routed - only the nlp data source (applied
+        # by _apply_openwebtext_nlp_source, called from calibrate()/train()) differs.
         return MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     if arm == "pooled":
         return MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
@@ -156,10 +159,11 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
     print(f"CUDA available: {torch.cuda.is_available()}  device: {torch.cuda.get_device_name(0)}", flush=True)
     if arm == "routed7":
         scale = "large"  # always large-scale, regardless of what --scale was passed
+    if arm in ("routed7", "routed8"):
         _apply_openwebtext_nlp_source()
 
     bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR,
-                              nlp_tokenizer_dir=OWT_NLP_TOKENIZER_DIR if arm == "routed7" else None)
+                              nlp_tokenizer_dir=OWT_NLP_TOKENIZER_DIR if arm in ("routed7", "routed8") else None)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     model = _build_model(arm, bundle, device, scale)
     print(f"{arm} ({scale}) params: {model.num_params():,}", flush=True)
@@ -172,7 +176,7 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             d: iter(DataLoader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
-    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7"):
+    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8"):
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
         loader = iter(DataLoader(PackedRoutedStream(
@@ -207,7 +211,7 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
-        elif arm in ("routed", "pooled", "pooled2", "routed5", "routed6", "routed7"):
+        elif arm in ("routed", "pooled", "pooled2", "routed5", "routed6", "routed7", "routed8"):
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
@@ -246,10 +250,11 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     print(f"ARM: {arm}  =  {ARM_LABELS.get(arm, arm)}", flush=True)
     if arm == "routed7":
         scale = "large"  # always large-scale, regardless of what --scale was passed
+    if arm in ("routed7", "routed8"):
         _apply_openwebtext_nlp_source()
 
     bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR,
-                              nlp_tokenizer_dir=OWT_NLP_TOKENIZER_DIR if arm == "routed7" else None)
+                              nlp_tokenizer_dir=OWT_NLP_TOKENIZER_DIR if arm in ("routed7", "routed8") else None)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     model = _build_model(arm, bundle, device, scale)
     print(f"{arm} ({scale}) params: {model.num_params():,}", flush=True)
@@ -293,7 +298,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             d: iter(DataLoader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
-    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7"):
+    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8"):
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
         loader = iter(DataLoader(PackedRoutedStream(
@@ -326,7 +331,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     from src.model.stage2_config import EVAL_EVERY, VAL_BATCHES, VAL_SEED
 
     val_iter = None
-    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4", "routed5", "routed6", "routed7"):
+    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4", "routed5", "routed6", "routed7", "routed8"):
         rs3 = arm == "routed3"
         seq_len = LONGCTX_MODEL_CFG["max_seq_len"] if arm in ("routed4", "routed6") else MODEL_CFG["max_seq_len"]
         val_stream = PackedRoutedStream(
@@ -374,7 +379,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             with torch.autocast("cuda"):
                 logits = model(domain, inp, types[:, :-1])
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
-        elif arm in ("routed", "routed7"):
+        elif arm in ("routed", "routed7", "routed8"):
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
@@ -469,7 +474,7 @@ if __name__ == "__main__":
     parser.add_argument("mode", choices=["calibrate", "train"])
     parser.add_argument("--arm", required=True,
                          choices=["mot", "baseline", "sota", "routed", "pooled", "hybrid", "pooled2",
-                                  "routed2", "routed3", "routed4", "routed5", "routed6", "routed7"])
+                                  "routed2", "routed3", "routed4", "routed5", "routed6", "routed7", "routed8"])
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--scale", choices=["base", "large"], default="base",
                          help="'large' (mot/baseline only) uses LARGE_MODEL_CFG for the scale test")

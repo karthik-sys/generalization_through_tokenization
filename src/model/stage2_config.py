@@ -141,7 +141,20 @@ ARM_LABELS = {
     "routed7": "Routed, LARGE scale, nlp domain sourced from OpenWebTextCorpus instead of FineWeb "
                "(code/math/science unchanged) - closes the data-source gap vs GPT-2 for the domain "
                "LAMBADA actually routes through",
+    "routed8": "Routed, BASE (champion) scale, nlp domain sourced from OpenWebTextCorpus - same "
+               "mechanism as routed7, at champion scale instead of large. Paired with routed7 run "
+               "to 600k steps: both target ~10B tokens/domain (llm.c's dedicated-GPT-2-124M-training "
+               "budget), testing whether per-domain token-volume equivalence matters independent of "
+               "model scale",
 }
+
+# routed7 (extended) and routed8 target ~600,000 steps rather than the usual 150,000. At
+# BATCH_SIZE*GRAD_ACCUM_STEPS*max_seq_len = 64*1024 tokens/step, 150,000 steps split evenly
+# across 4 domains (the doc-composition sampler treats all 4 symmetrically - see
+# stage2_routed_stream.py) works out to ~2.46B tokens/domain. llm.c's GPT-2-124M reproduction
+# (github.com/karpathy/llm.c) needed ~10B tokens dedicated to ONE domain to reach GPT-2's real
+# reported performance - 4x closes that gap for every domain at once, not just nlp.
+DATA_EQUIVALENT_STEPS = 600000
 
 # arm="hybrid" only: fraction of training steps drawing a natural single-domain batch
 # (PackedDomainStream, long continuous context - what MoT trains on exclusively) rather than
