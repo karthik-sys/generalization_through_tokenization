@@ -1,11 +1,53 @@
 {
-  "updated": "2026-08-17T00:20Z",
+  "updated": "2026-08-17T02:35Z",
   "in_flight": [
-    {"arm":"hybrid","base":"Routed","step":114950,"total":150000,"tests":"+ GradNorm switch-loss + 60% natural-data blend"},
-    {"arm":"pooled2","base":"Pooled","step":92950,"total":150000,"tests":"+ GradNorm + sparse top-2/16 routing, no confidence head"},
-    {"arm":"routed2","base":"Routed","step":66250,"total":150000,"tests":"+ GradNorm loss ONLY (isolates the loss fix)"},
-    {"arm":"routed3","base":"Routed","step":64000,"total":150000,"tests":"+ GradNorm + 2.4x denser cross-domain data"},
-    {"arm":"routed-large","base":"Routed","step":3700,"total":150000,"tests":"SCALE TEST — 190M params (2.1x): does the champion survive scale"},
-    {"arm":"baseline-large","base":"Baseline","step":3500,"total":150000,"tests":"SCALE TEST — 160M unified-BPE control"}
+    {
+      "arm": "baseline-large",
+      "base": "Baseline",
+      "step": 60250,
+      "total": 150000,
+      "state": "running",
+      "tests": "SCALE TEST - 160M unified-BPE control"
+    },
+    {
+      "arm": "routed-large",
+      "base": "Routed",
+      "step": 15900,
+      "total": 150000,
+      "state": "running",
+      "tests": "SCALE TEST - 190M (2.1x): does the champion survive scale"
+    },
+    {
+      "arm": "hybrid",
+      "base": "Routed",
+      "step": 144000,
+      "total": 150000,
+      "state": "stopped",
+      "tests": "+ GradNorm switch-loss + 60% natural-data blend - process stopped, eval-ready or restart"
+    },
+    {
+      "arm": "pooled2",
+      "base": "Pooled",
+      "step": 124000,
+      "total": 150000,
+      "state": "stopped",
+      "tests": "+ GradNorm + sparse top-2/16 routing, no confidence head - process stopped, eval-ready or restart"
+    },
+    {
+      "arm": "routed2",
+      "base": "Routed",
+      "step": 107000,
+      "total": 150000,
+      "state": "stopped",
+      "tests": "+ GradNorm loss ONLY (isolates the loss fix) - process stopped, eval-ready or restart"
+    },
+    {
+      "arm": "routed3",
+      "base": "Routed",
+      "step": 150000,
+      "total": 150000,
+      "state": "done",
+      "tests": "+ GradNorm + 2.4x denser cross-domain data - finished cleanly, checkpoint saved, awaiting eval"
+    }
   ]
 }

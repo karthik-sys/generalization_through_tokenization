@@ -83,10 +83,14 @@ def inflight_rows() -> str:
     rows = []
     for a in live.get("in_flight", []):
         pct = 100 * a["step"] / a["total"]
+        state = a.get("state", "running")
+        pill_cls = {"running": "pill live", "done": "pill done", "stopped": "pill warn"}.get(state, "pill live")
+        suffix = {"done": " · DONE", "stopped": " · STOPPED"}.get(state, "")
+        pill_txt = f'{a["step"]//1000}k / {a["total"]//1000}k · {pct:.0f}%{suffix}'
         rows.append(
             f'<tr><td><b>{html.escape(a["arm"])}</b> <small class="mono" style="color:var(--text3)">'
             f'{html.escape(a.get("base",""))} variant</small></td>'
-            f'<td><span class="pill live">{a["step"]//1000}k / {a["total"]//1000}k · {pct:.0f}%</span></td>'
+            f'<td><span class="{pill_cls}">{pill_txt}</span></td>'
             f'<td>{html.escape(a.get("tests",""))}</td></tr>'
         )
     return "\n".join(rows), live.get("updated", "")
