@@ -29,6 +29,48 @@ Architecture is otherwise identical to `routed --scale large` (the existing scal
 GradNorm, no other changes. This isolates "same architecture, same scale, only the nlp
 corpus changed" as cleanly as possible.
 
+## The nlp tokenizer also needed retraining — don't skip this
+
+Swapping the training *data* isn't enough on its own: the nlp tokenizer's vocabulary/merges
+were fit on FineWeb, so without this step routed7 would be encoding OpenWebText with a
+tokenizer that's never seen it — out of its fitting distribution. Both are general English
+web text (not a broken combination the way a code tokenizer on prose would be), but it's not
+a clean setup either.
+
+`scripts/retrain_nlp_tokenizer_openwebtext.py` fits a fresh nlp tokenizer directly on an
+OpenWebText sample (50k docs, same vocab-size constants as the original — `NLP_SURFACE_VOCAB`
+/`NLP_SYLLABLE_VOCAB`/`NLP_MORPHEME_VOCAB` — so embedding table dimensions stay identical, no
+model-architecture changes needed). Saves to `tokenizers_stage2_owt/nlp/` — a **separate**
+directory from the shared `tokenizers_stage2/`, so it never touches the tokenizer every other
+arm depends on. CPU-only (SentencePiece + Morfessor + pyphen, no GPU ops) — run it on the pod
+before starting training, no separate machine needed:
+
+```bash
+cd /workspace/repo && python3 scripts/retrain_nlp_tokenizer_openwebtext.py
+```
+
+Takes a few minutes (sampling 50k docs from OpenWebText, then fitting three tokenizer tiers:
+surface via SentencePiece, syllable via pyphen, morpheme via Morfessor — Morfessor is the
+slow one). Verified locally with a real smoke run (300 docs, not the full 50k): surface and
+syllable tiers trained cleanly with real output files in a few minutes, confirming the code
+path itself is correct. The full 50k-doc run wasn't waited on locally — running it here on
+the pod, right before training, is the actual intended path, not something that depends on
+any file generated elsewhere.
+
+When it finishes you should have:
+
+```
+tokenizers_stage2_owt/nlp/surface.model
+tokenizers_stage2_owt/nlp/surface.vocab
+tokenizers_stage2_owt/nlp/syllable_vocab.json
+tokenizers_stage2_owt/nlp/morpheme_vocab.json   (or similar - the Morfessor output)
+```
+
+If this step is skipped, `calibrate`/`train` will still run (the code falls back cleanly to
+looking in that directory), but will hard-fail with a file-not-found error rather than
+silently using the wrong tokenizer — so a skipped step surfaces immediately, it doesn't
+quietly corrupt the run.
+
 ## Mechanism (for context, not action needed)
 
 `_apply_openwebtext_nlp_source()` in `scripts/train_stage2_pod.py` mutates the shared
@@ -90,8 +132,18 @@ command.
 
 ## When it's done (or checking in on progress)
 
-Same eval flow as every other arm this session — pull the checkpoint, MD5-verify against
-the pod's copy, push to the Modal volume as `large_routed7_step<N>.pt`, then:
+**One-time, before the first eval only:** the retrained nlp tokenizer lives on the training
+pod's local disk (`tokenizers_stage2_owt/nlp/`), but eval runs on Modal and reads from the
+Modal *volume*, not the pod — it needs to be pushed there too, same as checkpoints:
+
+```bash
+python3 -m modal volume put mot-stage2-data tokenizers_stage2_owt/nlp tokenizers_stage2_owt/nlp
+```
+
+(Run once. Every later eval call reuses it — no need to re-push after that.)
+
+Then the normal flow — pull the checkpoint, MD5-verify against the pod's copy, push to the
+Modal volume as `large_routed7_step<N>.pt`, then:
 
 ```bash
 python3 -m modal run stage2_modal.py --step evaluate --arm routed7 --steps 150000
