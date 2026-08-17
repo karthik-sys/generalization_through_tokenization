@@ -1,45 +1,29 @@
 {
-  "updated": "2026-08-17T02:49Z",
+  "updated": "2026-08-17T17:20Z",
   "in_flight": [
     {
-      "arm": "baseline-large",
-      "base": "Baseline",
-      "step": 65300,
-      "total": 150000,
+      "arm": "routed8",
+      "base": "Routed",
+      "step": 59450,
+      "total": 600000,
       "state": "running",
-      "tests": "SCALE TEST - 160M unified-BPE control"
+      "tests": "4x-Data-Volume - nlp OWT-sourced, 600k steps (matches llm.c's ~10B-token/domain budget)"
     },
     {
-      "arm": "routed-large",
+      "arm": "routed9",
       "base": "Routed",
-      "step": 15900,
-      "total": 150000,
-      "state": "running",
-      "tests": "SCALE TEST - 190M (2.1x): does the champion survive scale"
+      "step": 0,
+      "total": 50000,
+      "state": "pending",
+      "tests": "Books+Warmstart-89M - blocked on the PG-19 nlp tokenizer (SentencePiece fit was stalling on full-length books, fixed by capping the fitting sample to 30k chars/doc)"
     },
     {
-      "arm": "hybrid",
-      "base": "Routed",
-      "step": 144000,
-      "total": 150000,
-      "state": "stopped",
-      "tests": "+ GradNorm switch-loss + 60% natural-data blend - process stopped, eval-ready or restart"
-    },
-    {
-      "arm": "pooled2",
-      "base": "Pooled",
-      "step": 124000,
-      "total": 150000,
-      "state": "stopped",
-      "tests": "+ GradNorm + sparse top-2/16 routing, no confidence head - process stopped, eval-ready or restart"
-    },
-    {
-      "arm": "routed2",
-      "base": "Routed",
-      "step": 107000,
-      "total": 150000,
-      "state": "stopped",
-      "tests": "+ GradNorm loss ONLY (isolates the loss fix) - process stopped, eval-ready or restart"
+      "arm": "routed10-large",
+      "base": "Routed7",
+      "step": 0,
+      "total": 50000,
+      "state": "pending",
+      "tests": "Books+Warmstart-190M - blocked on the same PG-19 tokenizer as routed9"
     }
   ]
 }

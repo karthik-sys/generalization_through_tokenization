@@ -277,6 +277,24 @@
     "step": 125000,
     "switch_accuracy": 0.2915
   },
+  "routed7-large@150000": {
+    "arm": "routed7",
+    "bpb_cross": 1.2137,
+    "bpb_single": 2.0042,
+    "lambada_accuracy": 0.04,
+    "lambada_ppl": 23.92,
+    "note": "FINAL, 150k/150k. Confirms the 125k snapshot: essentially plateaued from 23.90->23.92 LAMBADA ppl over the last 25k steps. vs routed-large final (150k, same arch/scale, FineWeb nlp instead of OpenWebText): BPB single 2.004 vs 2.009 (near-identical), BPB cross 1.214 vs 1.203 (routed-large marginally better here), LAMBADA ppl 23.92 vs 24.17 (routed7 better), LAMBADA exact-match 4.00% vs 4.2% (routed-large marginally better). Net: OpenWebText-sourcing nets a small, real perplexity win but is a wash on exact-match and cross-domain BPB - a real but modest effect, not the big lever. Plateauing before 150k is the more decisive finding: motivates testing data volume/mixture-share levers (routed8/9/10) rather than just more steps on this exact recipe.",
+    "params": 190481644,
+    "per_domain_bpb": {
+      "code": 1.171,
+      "math": 2.3407,
+      "nlp": 2.4246,
+      "science": 2.1108
+    },
+    "scale": "large",
+    "step": 150000,
+    "switch_accuracy": 0.2959
+  },
   "routed@100000": {
     "arm": "routed",
     "bpb_cross": 1.589,

@@ -29,15 +29,25 @@ LIVE = REPO / "results" / "live_status.json"
 LOSS_CURVES = REPO / "results" / "loss_curves.json"
 
 ARM_META = {  # display order-ish + colors, single source
+    # names describe WHAT was tried, not the trial number it happened to launch as - "routed7"
+    # tells you nothing about the run; "GPT-2-Corpus" does. Internal --arm codes (routed2..10)
+    # stay as-is (checkpoint filenames + live pod flags depend on them), this is display-only.
     "mot": ("MoT", "disjoint tables", "var(--mot)"),
-    "routed": ("Routed", "mid-seq switching", "var(--routed)"),
+    "routed": ("Routed", "mid-seq switching (champion)", "var(--routed)"),
     "baseline": ("Baseline", "unified 48k BPE", "var(--baseline)"),
     "sota": ("SOTA", "cl100k, 100k vocab", "var(--sota)"),
     "pooled": ("Pooled", "PMA/DANN + fitting loss", "var(--pooled)"),
-    "hybrid": ("Hybrid", "GradNorm switch loss + blend", "var(--routed)"),
-    "routed2": ("Routed2", "GradNorm loss only", "var(--routed)"),
-    "routed3": ("Routed3", "GradNorm + denser data", "var(--routed)"),
-    "pooled2": ("Pooled2", "GradNorm + sparse routing", "var(--pooled)"),
+    "hybrid": ("Hybrid", "GradNorm switch loss + 60% natural-data blend", "var(--routed)"),
+    "routed2": ("GradNorm-only", "GradNorm switch loss, data unchanged", "var(--routed)"),
+    "routed3": ("GradNorm+Dense", "GradNorm + max cross-domain density", "var(--routed)"),
+    "pooled2": ("Pooled2", "GradNorm + sparse top-2/16 routing", "var(--pooled)"),
+    "routed4": ("Decoupled+LearnedWeight", "gradient-decoupled head + Kendall uncertainty weight", "var(--routed)"),
+    "routed5": ("Decoupled-Head", "gradient-decoupled switch head only (reserved ablation)", "var(--routed)"),
+    "routed6": ("Long-Context", "2x context (2048), otherwise unchanged (reserved ablation)", "var(--routed)"),
+    "routed7-large": ("GPT-2-Corpus", "nlp sourced from OpenWebText, large scale", "var(--routed)"),
+    "routed8": ("4x-Data-Volume", "nlp OWT-sourced, 4x steps (600k) - matches llm.c's 10B tok/domain budget", "var(--routed)"),
+    "routed9": ("Books+Warmstart-89M", "PG-19 books, ~55% nlp mixture, warm-started from champion", "var(--routed)"),
+    "routed10-large": ("Books+Warmstart-190M", "PG-19 books, ~55% nlp mixture, warm-started from routed7", "var(--routed)"),
     "routed-large": ("Routed-large", "190M scale test", "var(--routed)"),
     "baseline-large": ("Baseline-large", "160M scale control", "var(--baseline)"),
     "mot-large": ("MoT-large", "190M scale test", "var(--mot)"),
@@ -89,11 +99,12 @@ def inflight_rows() -> str:
     for a in live.get("in_flight", []):
         pct = 100 * a["step"] / a["total"]
         state = a.get("state", "running")
-        pill_cls = {"running": "pill live", "done": "pill done", "stopped": "pill warn"}.get(state, "pill live")
-        suffix = {"done": " · DONE", "stopped": " · STOPPED"}.get(state, "")
+        pill_cls = {"running": "pill live", "done": "pill done", "stopped": "pill warn", "pending": "pill"}.get(state, "pill live")
+        suffix = {"done": " · DONE", "stopped": " · STOPPED", "pending": " · PENDING"}.get(state, "")
         pill_txt = f'{a["step"]//1000}k / {a["total"]//1000}k · {pct:.0f}%{suffix}'
+        name, _, _ = ARM_META.get(a["arm"], (a["arm"], "", None))
         rows.append(
-            f'<tr><td><b>{html.escape(a["arm"])}</b> <small class="mono" style="color:var(--text3)">'
+            f'<tr><td><b>{html.escape(name)}</b> <small class="mono" style="color:var(--text3)">'
             f'{html.escape(a.get("base",""))} variant</small></td>'
             f'<td><span class="{pill_cls}">{pill_txt}</span></td>'
             f'<td>{html.escape(a.get("tests",""))}</td></tr>'
