@@ -1,10 +1,10 @@
 {
-  "updated": "2026-08-17T02:35Z",
+  "updated": "2026-08-17T02:49Z",
   "in_flight": [
     {
       "arm": "baseline-large",
       "base": "Baseline",
-      "step": 60250,
+      "step": 65300,
       "total": 150000,
       "state": "running",
       "tests": "SCALE TEST - 160M unified-BPE control"
@@ -16,6 +16,14 @@
       "total": 150000,
       "state": "running",
       "tests": "SCALE TEST - 190M (2.1x): does the champion survive scale"
+    },
+    {
+      "arm": "routed3",
+      "base": "Routed",
+      "step": 150000,
+      "total": 150000,
+      "state": "stopped",
+      "tests": "+ GradNorm + 2.4x denser cross-domain data - process stopped, eval-ready or restart"
     },
     {
       "arm": "hybrid",
@@ -40,14 +48,6 @@
       "total": 150000,
       "state": "stopped",
       "tests": "+ GradNorm loss ONLY (isolates the loss fix) - process stopped, eval-ready or restart"
-    },
-    {
-      "arm": "routed3",
-      "base": "Routed",
-      "step": 150000,
-      "total": 150000,
-      "state": "done",
-      "tests": "+ GradNorm + 2.4x denser cross-domain data - finished cleanly, checkpoint saved, awaiting eval"
     }
   ]
 }

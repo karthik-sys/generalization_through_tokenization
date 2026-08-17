@@ -64,14 +64,38 @@ REMOTE = (
     '  step=$(echo "$base" | grep -oE "[0-9]+$"); '
     '  rest=${base%_step*}; '                   # large_routed  or  pooled2
     '  case "$rest" in large_*) scale=large; arm=${rest#large_};; *) arm=$rest;; esac; '
+    '  log=$([ "$scale" = large ] && echo train_large.log || echo train.log); '
     'fi; '
-    'echo "ARM=$arm SCALE=$scale ALIVE=$alive STEP=$step"'
+    'echo "ARM=$arm SCALE=$scale ALIVE=$alive STEP=$step"; '
+    # loss history for the chart: full-log scan is safe now that -a forces text mode (the
+    # earlier corruption bug was grep's binary heuristic silently truncating a scan WITHOUT
+    # -a, not the full-file read itself) - so pull the whole step/loss series, not just the
+    # tail, and let the caller downsample it.
+    'echo "===LOSS_START==="; grep -aoE "step [0-9]+/[0-9]+  loss=[0-9.]+" "$log" 2>/dev/null; echo "===LOSS_END==="'
 )
 
+def downsample(points, n=50):
+    """Evenly-spaced subset of (step, loss) pairs, always keeping the first and last."""
+    if len(points) <= n:
+        return points
+    idx = [round(i * (len(points) - 1) / (n - 1)) for i in range(n)]
+    seen_i, out = set(), []
+    for i in idx:
+        if i not in seen_i:
+            seen_i.add(i); out.append(points[i])
+    return out
+
 try:
-    prev = {a["arm"]: a["step"] for a in json.load(open("results/live_status.json")).get("in_flight", [])}
+    prev_rows = json.load(open("results/live_status.json")).get("in_flight", [])
 except FileNotFoundError:
-    prev = {}
+    prev_rows = []
+prev = {a["arm"]: a["step"] for a in prev_rows}
+prev_full = {a["arm"]: a for a in prev_rows}
+
+try:
+    loss_curves = json.load(open("results/loss_curves.json"))
+except FileNotFoundError:
+    loss_curves = {}
 
 seen = {}
 for ep in sys.argv[1:]:
@@ -89,6 +113,14 @@ for ep in sys.argv[1:]:
         arm = f"{arm}-large"
     step = int(m["STEP"]) if m.get("STEP") else 0
     alive = m.get("ALIVE") == "1"
+
+    loss_block = out.split("===LOSS_START===\n", 1)
+    if len(loss_block) == 2:
+        body = loss_block[1].split("===LOSS_END===", 1)[0]
+        pts = [(int(s), float(l)) for s, l in
+               re.findall(r"step (\d+)/\d+\s+loss=([0-9.]+)", body)]
+        if pts:
+            loss_curves[arm] = downsample(pts)
     # A running arm's step should only go up. A lower reading than last time means the read was
     # corrupted (see the tail -c comment above) rather than the run rewinding - keep the last
     # known-good step in that case instead of publishing a regression.
@@ -103,15 +135,28 @@ for ep in sys.argv[1:]:
                  "state": "running" if alive else "stopped",
                  "tests": tests + ("" if alive else " - process stopped, eval-ready or restart")}
 
+# Carry forward arms this cycle's endpoints didn't cover at all (e.g. a pod that fully
+# terminated, so there's no SSH endpoint left to sweep) - a pod going away entirely is not
+# the same as the arm no longer existing. Only "done"/eval-recorded rows are worth keeping
+# indefinitely; a "stopped" row not re-sighted just means we lost reach to a still-dead pod,
+# which is also worth keeping rather than silently deleting.
+for name, row in prev_full.items():
+    if name not in seen:
+        seen[name] = row
+        print(f"  = {name}: not covered this cycle (pod likely terminated), carrying forward "
+              f"last known state (step {row['step']}, {row['state']})", file=sys.stderr)
+
 # order: large scale runs first, then by step desc
 order = sorted(seen.values(),
                key=lambda a: (0 if a["arm"].endswith("-large") else 1, -a["step"]))
 live = {"updated": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ"),
         "in_flight": order}
 open("results/live_status.json", "w").write(json.dumps(live, indent=2))
+open("results/loss_curves.json", "w").write(json.dumps(loss_curves, indent=2))
 print(f"live_status.json: {len(order)} arms -> " +
       ", ".join(f'{a["arm"]}@{a["step"]//1000}k{"" if a["state"]=="running" else "(stopped)"}'
                 for a in order))
+print(f"loss_curves.json: {len(loss_curves)} arms with loss history")
 PYEOF
 
 python3 scripts/gen_dashboard.py | tail -1

@@ -53,6 +53,8 @@ td.num{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:righ
 .sw{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:600;padding:1px 7px;border-radius:5px;margin:0 2px;background:var(--routed);color:#fff}
 .legend{display:flex;flex-wrap:wrap;gap:14px;font-size:12.5px;font-family:var(--mono);margin:6px 2px 0;color:var(--text2)}
 .legend i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:6px;vertical-align:middle}
+.variants{margin-top:10px;padding-top:10px;border-top:1px dashed var(--border2);font-family:var(--mono);font-size:10.5px;line-height:1.6;color:var(--text3)}
+.variants b{color:var(--text2);font-weight:500}
 .finding{border-left:3px solid var(--mot);padding:2px 0 2px 14px;margin:14px 0}
 .finding b{color:var(--text)}
 a{color:var(--mot)}
@@ -62,7 +64,7 @@ a{color:var(--mot)}
 
 <p class="eyebrow">karthik-sys / generalization_through_tokenization · stage 2</p>
 <h1>Mixture-of-Tokenizers — build console</h1>
-<p class="sub">Does domain-routed, multi-tokenizer LLM architecture beat unified BPE at matched small scale (68–122M params)? Live results across 9 architecture arms.</p>
+<p class="sub">Does domain-routed, multi-tokenizer LLM architecture beat unified BPE at matched small scale (68–190M params)? 5 base architectures, 11 arms total counting variants and scale tests.</p>
 
 <div class="finding" style="margin-top:20px">
 <b>Headline:</b> MoT-family arms don't just win on paper — <b>routed generates real domain switches behaviorally</b> (seeded in science, it emits a switch token and writes valid Python, then LaTeX, then prose), and it posts the best out-of-domain generalization of any arm (LAMBADA perplexity <b>48</b> vs unified-BPE baseline's <b>7,786</b> and cl100k SOTA's <b>72,149</b>). Full detail below.
@@ -113,6 +115,7 @@ from …</div>
   <div class="box">single head<small>48k vocab</small></div>
   <div class="arw">↓</div>
   <div class="box">next token</div>
+  <div class="variants"><b>+1 scale variant:</b> baseline-large (160M, 2.3×)</div>
 </div>
 
 <div class="arch">
@@ -155,6 +158,7 @@ from …</div>
   <div class="box hi" style="border-color:var(--routed)">widened heads<small>+4 switch slots</small></div>
   <div class="arw">↓</div>
   <div class="box">next token <b>or</b> switch<small>predicts domain jumps</small></div>
+  <div class="variants"><b>+4 variants:</b> routed2 (GradNorm loss only) · routed3 (GradNorm + denser data — done) · hybrid (GradNorm + data blend) · routed-large (190M, 2.1×)</div>
 </div>
 
 <div class="arch">
@@ -169,11 +173,12 @@ from …</div>
   <div class="box hi" style="border-color:var(--pooled)">widened heads<small>+ fitting loss</small></div>
   <div class="arw">↓</div>
   <div class="box">next token <b>or</b> switch</div>
+  <div class="variants"><b>+1 variant:</b> pooled2 (GradNorm + sparse top-2/16 routing, no confidence head)</div>
 </div>
 
 </div>
 
-<h2>Training loss — all 5, to their latest checkpoint</h2>
+<h2>Training loss — the 5 base architectures, to their final checkpoint</h2>
 <div class="card" style="margin-top:12px">
 <div class="legend">
 <span><i style="background:var(--mot)"></i>MoT</span>
@@ -204,6 +209,17 @@ from …</div>
 </svg>
 </div>
 <p class="note" style="margin-top:8px">Reconstructed from checkpoint history on the Modal volume (survives the relaunches that gapped the local logs). Raw training loss is NOT cross-comparable (different vocab entropy floors, and routed/pooled carry switch/aux loss terms) — it's a health check, not a scoreboard. The real ranking is BPB + LAMBADA above. Snapshot, not live: a published page can't poll the pods.</p>
+</div>
+
+<h2>Live arms — loss trend <small class='mono' style='color:var(--text3);font-weight:400'>({{UPDATED}})</small></h2>
+<p class="note" style="margin-top:2px">The in-flight variants sum several weighted loss terms (GradNorm-balanced), so their raw loss isn't on the same scale as the archived arms above, or even directly against each other. Each line here is normalized to <b>that arm's own</b> early loss (avg of its first 3 logged points = 1.0x) — this shows convergence <i>shape</i>, not a ranking.</p>
+<div class="card" style="margin-top:12px">
+<div class="legend">
+{{LIVE_LOSS_LEGEND}}
+</div>
+<div style="overflow-x:auto">
+{{LIVE_LOSS_SVG}}
+</div>
 </div>
 
 <h2>In flight now — live pod status <small class='mono' style='color:var(--text3);font-weight:400'>({{UPDATED}})</small></h2>
