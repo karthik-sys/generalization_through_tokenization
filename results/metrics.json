@@ -61,6 +61,24 @@
     "scale": "base",
     "step": 150000
   },
+  "pooled2@150000": {
+    "arm": "pooled2",
+    "bpb_cross": 2.223,
+    "bpb_single": 2.4089,
+    "lambada_accuracy": 0.0,
+    "lambada_ppl": 312.88,
+    "note": "GradNorm + sparse top-2/16 routing, no confidence head - matched to 150k. Regression vs original pooled on every metric: BPB single 2.409 vs 2.384, cross 2.223 vs 2.135, switch 25.1% vs 27.4%, LAMBADA 312.9 vs 280.5. Cross-domain still beats single-domain (2.223 vs 2.409) - the switching-arm compression effect holds - but the GradNorm+sparse-routing change did not help.",
+    "params": 98720785,
+    "per_domain_bpb": {
+      "code": 2.2796,
+      "math": 2.762,
+      "nlp": 2.5243,
+      "science": 2.1519
+    },
+    "scale": "base",
+    "step": 150000,
+    "switch_accuracy": 0.2512
+  },
   "pooled@150000": {
     "arm": "pooled",
     "bpb_cross": 2.135,
@@ -89,6 +107,60 @@
     "scale": "base",
     "step": 82000,
     "switch_accuracy": 0.2595
+  },
+  "routed-large@40000": {
+    "arm": "routed",
+    "bpb_cross": 1.5407,
+    "bpb_single": 2.0015,
+    "lambada_accuracy": 0.0,
+    "lambada_ppl": 56.81,
+    "note": "SCALE TEST snapshot, 27% through training (40k/150k) - NOT final. Already matches or beats the fully-trained 89M champion (BPB single 2.002 vs 2.075, cross 1.541 vs 1.544, switch 28.8% vs 26%) with 110k steps left. LAMBADA slightly behind (56.8 vs 47.76) but converging. Early positive signal for scale survival.",
+    "params": 190481644,
+    "per_domain_bpb": {
+      "code": 1.4799,
+      "math": 2.2451,
+      "nlp": 2.277,
+      "science": 2.0381
+    },
+    "scale": "large",
+    "step": 40000,
+    "switch_accuracy": 0.2877
+  },
+  "routed-large@52000": {
+    "arm": "routed",
+    "bpb_cross": 1.4193,
+    "bpb_single": 1.8885,
+    "lambada_accuracy": 0.016,
+    "lambada_ppl": 41.33,
+    "note": "SCALE TEST snapshot, 35% through training (52k/150k) - NOT final. Now BEATS the fully-trained 89M champion on every metric (BPB single 1.889 vs 2.075, cross 1.419 vs 1.544, LAMBADA 41.3 vs 47.76), and exact-match jumped to 1.6% (vs champions 0.4%) - first arm all session to climb meaningfully off the near-zero floor. 98k steps still remain. Strong positive trajectory for scale survival, still pending the real comparison vs baseline-large.",
+    "params": 190481644,
+    "per_domain_bpb": {
+      "code": 1.2767,
+      "math": 2.2103,
+      "nlp": 2.1461,
+      "science": 1.9482
+    },
+    "scale": "large",
+    "step": 52000,
+    "switch_accuracy": 0.2736
+  },
+  "routed2@150000": {
+    "arm": "routed2",
+    "bpb_cross": 2.8226,
+    "bpb_single": 3.3873,
+    "lambada_accuracy": 0.0,
+    "lambada_ppl": 1597.86,
+    "note": "GradNorm loss ONLY (isolates the loss fix, no other changes) - matched to 150k. Severe regression vs routed champion: BPB single 3.387 vs 2.075 (+63%), cross 2.823 vs 1.544 (+83%), LAMBADA 1598 vs 47.76 (33x worse). Switch acc improved (33.5% vs 26%). Third GradNorm variant (with routed3, pooled2) showing the same trade: switch-prediction gains at a severe cost to language modeling quality. This isolates the loss-function change alone as the culprit, not data density or routing sparsity.",
+    "params": 89114364,
+    "per_domain_bpb": {
+      "code": 3.2375,
+      "math": 3.9797,
+      "nlp": 3.5502,
+      "science": 2.9231
+    },
+    "scale": "base",
+    "step": 150000,
+    "switch_accuracy": 0.3353
   },
   "routed3@150000": {
     "arm": "routed3",
