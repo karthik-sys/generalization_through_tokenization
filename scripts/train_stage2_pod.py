@@ -32,12 +32,14 @@ from src.model.mot_hybrid_model import MoTHybridModel
 from src.model.mot_model import MoTModel
 from src.model.mot_pooled2_model import MoTPooled2Model
 from src.model.mot_pooled_model import MoTPooledModel
+from src.model.mot_routed_combined_model import MoTRoutedCombinedModel
+from src.model.mot_routed_decoupled_model import MoTRoutedDecoupledModel
 from src.model.mot_routed_model import MoTRoutedModel
 from src.model.stage2_config import (
     ADV_LAMBDA_RAMP_STEPS, ARM_LABELS, BACKBONE_ONLY_CFG, BATCH_SIZE, CHECKPOINT_EVERY,
     CONFIDENCE_WEIGHT, FOCAL_GAMMA, GRAD_ACCUM_STEPS, HYBRID_NATURAL_DATA_FRACTION, LOG_EVERY,
-    LR, MAX_STEPS, MODEL_CFG, ROUTED3_MAX_DOMAINS, ROUTED3_MIN_DOMAINS, ROUTED3_SNIPPET_WORDS,
-    SWITCH_WEIGHT, WARMUP_STEPS,
+    LONGCTX_MODEL_CFG, LR, MAX_STEPS, MODEL_CFG, ROUTED3_MAX_DOMAINS, ROUTED3_MIN_DOMAINS,
+    ROUTED3_SNIPPET_WORDS, SWITCH_WEIGHT, WARMUP_STEPS,
 )
 
 TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2")
@@ -101,6 +103,16 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
         # same GradNorm-balanced architecture as hybrid - routed2/routed3 differ from hybrid
         # (and from each other) only in what data feeds them, not in model code.
         return MoTHybridModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    if arm == "routed4":
+        # all three fixes stacked: decoupled switch head + learned switch weight + 2x context.
+        return MoTRoutedCombinedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LONGCTX_MODEL_CFG).to(device)
+    if arm == "routed5":
+        # decoupled-head-only, standard 1024 context - kept for a later ablation pass if
+        # routed4's combined result is worth pulling apart, not launched tonight.
+        return MoTRoutedDecoupledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    if arm == "routed6":
+        # long-context-only, standard head/weight - same ablation-reserve status as routed5.
+        return MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LONGCTX_MODEL_CFG).to(device)
     if arm == "baseline":
         return BaselineModel(vocab_size=bundle.baseline_vocab_size, **BACKBONE_ONLY_CFG).to(device)
     return BaselineModel(vocab_size=bundle.sota_vocab_size, **BACKBONE_ONLY_CFG).to(device)
@@ -123,7 +135,7 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             d: iter(DataLoader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
-    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2"):
+    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5"):
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
         loader = iter(DataLoader(PackedRoutedStream(
@@ -131,6 +143,8 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             min_domains=ROUTED3_MIN_DOMAINS, max_domains=ROUTED3_MAX_DOMAINS,
             snippet_words=ROUTED3_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
+    elif arm in ("routed4", "routed6"):  # both use 2x context
+        loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, LONGCTX_MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm not in ("mot",):
         encode_fn = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
         loader = iter(DataLoader(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
@@ -149,12 +163,14 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             tok, dom, ctrl, typ, tgt = _hybrid_batch(step, domains, domain_index, loaders, loader, device)
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
-        elif arm in ("routed2", "routed3"):
+        elif arm in ("routed2", "routed3", "routed4"):
+            # routed4 (combined: decoupled head + learned weight) takes no switch_weight
+            # kwarg - it's an internal learned parameter, same call shape as routed2/routed3.
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
-        elif arm in ("routed", "pooled", "pooled2"):
+        elif arm in ("routed", "pooled", "pooled2", "routed5", "routed6"):
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
@@ -236,7 +252,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             d: iter(DataLoader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
-    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2"):
+    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5"):
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
         loader = iter(DataLoader(PackedRoutedStream(
@@ -244,12 +260,18 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             min_domains=ROUTED3_MIN_DOMAINS, max_domains=ROUTED3_MAX_DOMAINS,
             snippet_words=ROUTED3_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
+    elif arm in ("routed4", "routed6"):  # both use 2x context
+        loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, LONGCTX_MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm not in ("mot",):
         encode_fn = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
         loader = iter(DataLoader(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
 
     controller = None
-    if arm in ("pooled", "pooled2", "hybrid", "routed2", "routed3"):
+    if arm in ("pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4"):
+        # routed4 gets the safety net too - its learned switch-weight is a dynamic parameter
+        # (same destabilization risk profile as GradNorm's EMA reweighting), even though the
+        # rest of its loss is standard CE. routed5/routed6 don't need it - fixed switch_weight,
+        # no dynamic loss-shaping component, same as plain routed.
         from src.model.adaptive_optimizer import AdaptiveController
         controller = AdaptiveController()
         print("adaptive controller ON (spike-guard + plateau rescue + online LR)", flush=True)
@@ -263,10 +285,11 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     from src.model.stage2_config import EVAL_EVERY, VAL_BATCHES, VAL_SEED
 
     val_iter = None
-    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed3"):
+    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4", "routed5", "routed6"):
         rs3 = arm == "routed3"
+        seq_len = LONGCTX_MODEL_CFG["max_seq_len"] if arm in ("routed4", "routed6") else MODEL_CFG["max_seq_len"]
         val_stream = PackedRoutedStream(
-            bundle, domain_index, MODEL_CFG["max_seq_len"], seed=VAL_SEED,
+            bundle, domain_index, seq_len, seed=VAL_SEED,
             min_domains=ROUTED3_MIN_DOMAINS if rs3 else 2,
             max_domains=ROUTED3_MAX_DOMAINS if rs3 else 4,
             snippet_words=ROUTED3_SNIPPET_WORDS if rs3 else 250,
@@ -320,12 +343,22 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             with torch.autocast("cuda"):
                 loss, parts = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
             controller_loss = parts["_content"]
-        elif arm in ("routed2", "routed3"):
+        elif arm in ("routed2", "routed3", "routed4"):
+            # routed4 (combined): no switch_weight kwarg, weight is an internal learned
+            # parameter. Same call shape as routed2/routed3 otherwise.
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
                 loss, parts = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
             controller_loss = parts["_content"]
+        elif arm in ("routed5", "routed6"):
+            # decoupled-head-only / long-context-only - fixed switch_weight, standard call
+            # shape identical to plain routed. Not in the controller list, so no
+            # controller_loss needed here.
+            tok, dom, ctrl, typ, tgt = next(loader)
+            tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
+            with torch.autocast("cuda"):
+                loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
         elif arm in ("pooled", "pooled2"):
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
@@ -343,7 +376,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
 
         loss_val = loss.item()
-        controller_loss_val = float(controller_loss) if arm in ("pooled", "pooled2", "hybrid", "routed2", "routed3") else loss_val
+        controller_loss_val = float(controller_loss) if arm in ("pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4") else loss_val
         if controller is not None and controller.should_skip(loss_val):
             opt.zero_grad()
             if step % LOG_EVERY == 0:
@@ -395,7 +428,7 @@ if __name__ == "__main__":
     parser.add_argument("mode", choices=["calibrate", "train"])
     parser.add_argument("--arm", required=True,
                          choices=["mot", "baseline", "sota", "routed", "pooled", "hybrid", "pooled2",
-                                  "routed2", "routed3"])
+                                  "routed2", "routed3", "routed4", "routed5", "routed6"])
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--scale", choices=["base", "large"], default="base",
                          help="'large' (mot/baseline only) uses LARGE_MODEL_CFG for the scale test")

@@ -555,7 +555,7 @@ def train(arm: str = "mot", max_steps: int | None = None, resume_from: str | Non
 
 @app.function(image=image, gpu="T4", volumes={VOLUME_PATH: volume}, timeout=1800,
               secrets=[modal.Secret.from_name("huggingface-token")])
-def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int = 200, noisy: bool = False):
+def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int = 200, noisy: bool = False, scale: str = "base"):
     """Held-out eval against a saved checkpoint. train()'s streams all start from the
     beginning of each HF source, so a fresh stream would just replay training data -
     this skips well past what 20-200k training steps could plausibly have consumed from
@@ -588,10 +588,14 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     from src.model.mot_pooled_model import MoTPooledModel
     from src.model.mot_routed_model import MoTRoutedModel
     from src.model.stage2_config import (
-        BACKBONE_ONLY_CFG, BATCH_SIZE, CONFIDENCE_WEIGHT, FOCAL_GAMMA, MODEL_CFG, STREAM_SOURCES,
+        BACKBONE_ONLY_CFG, BATCH_SIZE, CONFIDENCE_WEIGHT, FOCAL_GAMMA, LARGE_BACKBONE_ONLY_CFG,
+        LARGE_MODEL_CFG, MODEL_CFG, STREAM_SOURCES,
     )
 
     device = "cuda"
+    MODEL_CFG = LARGE_MODEL_CFG if scale == "large" else MODEL_CFG
+    BACKBONE_ONLY_CFG = LARGE_BACKBONE_ONLY_CFG if scale == "large" else BACKBONE_ONLY_CFG
+    ckpt_prefix = f"large_{arm}" if scale == "large" else arm
     SKIP_DOCS = 300_000  # well past what 20k-200k training steps could consume from million-row sources
 
     def _corrupt(text: str, rate: float = 0.08) -> str:
@@ -755,7 +759,7 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
                         buf = buf[self.seq_len + 1:]
 
     bundle = TokenizerBundle(tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2")
-    ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{arm}_step{checkpoint_step}.pt", map_location=device)
+    ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3")  # arms with disjoint per-domain heads
@@ -777,7 +781,7 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
         model = BaselineModel(vocab_size=bundle.sota_vocab_size, **BACKBONE_ONLY_CFG).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
-    print(f"loaded {arm} checkpoint at step {ckpt['step']}", flush=True)
+    print(f"loaded {ckpt_prefix} checkpoint at step {ckpt['step']}", flush=True)
 
     # --- bits-per-byte machinery ---------------------------------------------------------
     # Per-token loss isn't comparable across arms with different vocabularies. BPB normalises
@@ -937,7 +941,7 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
 
 @app.function(image=image, gpu="T4", volumes={VOLUME_PATH: volume}, timeout=1800,
               secrets=[modal.Secret.from_name("huggingface-token")])
-def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples: int = 500):
+def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples: int = 500, scale: str = "base"):
     """LAMBADA (Paperno et al. 2016): predict the final word of a passage, given the full
     preceding context. Deliberately NOT the same axis as BPB - BPB measures compression on
     held-out text drawn from the SAME domains/tokenizers the model trained on, so a model
@@ -977,12 +981,18 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     from src.model.mot_pooled2_model import MoTPooled2Model
     from src.model.mot_pooled_model import MoTPooledModel
     from src.model.mot_routed_model import MoTRoutedModel
-    from src.model.stage2_config import BACKBONE_ONLY_CFG, CONFIDENCE_WEIGHT, FOCAL_GAMMA, MODEL_CFG
+    from src.model.stage2_config import (
+        BACKBONE_ONLY_CFG, CONFIDENCE_WEIGHT, FOCAL_GAMMA, LARGE_BACKBONE_ONLY_CFG, LARGE_MODEL_CFG,
+        MODEL_CFG,
+    )
 
     device = "cuda"
+    MODEL_CFG = LARGE_MODEL_CFG if scale == "large" else MODEL_CFG
+    BACKBONE_ONLY_CFG = LARGE_BACKBONE_ONLY_CFG if scale == "large" else BACKBONE_ONLY_CFG
+    ckpt_prefix = f"large_{arm}" if scale == "large" else arm
     seq_len = MODEL_CFG["max_seq_len"]
     bundle = TokenizerBundle(tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2")
-    ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{arm}_step{checkpoint_step}.pt", map_location=device)
+    ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3")
@@ -1006,7 +1016,7 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
         model = BaselineModel(vocab_size=bundle.sota_vocab_size, **BACKBONE_ONLY_CFG).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
-    print(f"loaded {arm} checkpoint at step {ckpt['step']}", flush=True)
+    print(f"loaded {ckpt_prefix} checkpoint at step {ckpt['step']}", flush=True)
 
     ds = load_dataset("EleutherAI/lambada_openai", "en", split="test", streaming=True)
     encode_fn = None
@@ -1247,7 +1257,7 @@ def generate(arm: str = "mot", checkpoint_step: int = 150000, seed_domain: str =
 
 
 @app.local_entrypoint()
-def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from: str = "", noisy: bool = False):
+def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from: str = "", noisy: bool = False, scale: str = "base"):
     """steps=0 means "use the default": 150 for calibrate, MAX_STEPS for train."""
     if step == "sample-tokenizers":
         sample_tokenizers.remote()
@@ -1260,7 +1270,7 @@ def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from:
         print(f"{sec_per_step:.3f} sec/step x {MAX_STEPS} steps = {sec_per_step*MAX_STEPS/3600:.2f} GPU-hours")
         print(f"at ~$0.59/hr (T4): ~${sec_per_step*MAX_STEPS/3600*0.59:.2f} for this arm")
     elif step == "evaluate":
-        result = evaluate.remote(arm=arm, checkpoint_step=steps or 20000, noisy=noisy)
+        result = evaluate.remote(arm=arm, checkpoint_step=steps or 20000, noisy=noisy, scale=scale)
         mode = "noisy" if noisy else "clean"
         print(f"\nheld-out single-domain BPB for {arm} ({mode}): {result['single_domain_bpb']:.4f} bits/byte")
         if result["cross_domain_bpb"] is not None:
@@ -1270,7 +1280,7 @@ def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from:
         history = train.remote(arm=arm, max_steps=steps or None, resume_from=resume_from or None)
         print(f"\nfinal logged losses: {history[-5:] if history else '(none)'}")
     elif step == "evaluate-lambada":
-        result = evaluate_lambada.remote(arm=arm, checkpoint_step=steps or 150000)
+        result = evaluate_lambada.remote(arm=arm, checkpoint_step=steps or 150000, scale=scale)
         print(f"\nLAMBADA for {arm}: accuracy={result['accuracy']:.4f}  "
               f"target-token ppl={result['target_token_ppl']:.2f}  "
               f"bits/target-token={result['bits_per_target_token']:.3f}")

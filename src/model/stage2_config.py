@@ -31,6 +31,11 @@ BACKBONE_ONLY_CFG = {k: v for k, v in MODEL_CFG.items() if k != "emb_dim"}
 LARGE_MODEL_CFG = dict(emb_dim=192, d_model=768, n_heads=12, ffn_dim=3072, n_layers=12, max_seq_len=1024)
 LARGE_BACKBONE_ONLY_CFG = {k: v for k, v in LARGE_MODEL_CFG.items() if k != "emb_dim"}
 
+# arm="routed6" only: plain MoTRoutedModel at 2x context (1024->2048), nothing else changed -
+# more room between switches for the model to re-establish domain state, without touching
+# loss weighting at all (unlike routed2/3/hybrid, which all failed by that route).
+LONGCTX_MODEL_CFG = dict(emb_dim=128, d_model=512, n_heads=8, ffn_dim=2048, n_layers=6, max_seq_len=2048)
+
 # BATCH_SIZE 16 OOM'd a real T4 (14.56GiB) during calibration - the logits tensor alone
 # is batch*seq*vocab*4 bytes, which at batch 16 / seq 1024 is 2.4GB for nlp's 36k vocab
 # and 6.6GB for cl100k_base's 100k vocab. Batch 4 keeps the largest arm's logits under
@@ -130,6 +135,9 @@ ARM_LABELS = {
     "pooled2": "Pooled v2 (GradNorm loss, sparse top-2/16 routing, 256-chunk PMA, no confidence head)",
     "routed2": "Routed + GradNorm switch loss ONLY (data unchanged - isolates hybrid's loss-fix credit)",
     "routed3": "Routed + GradNorm + maximized cross-domain density (always 4 domains/doc, shorter snippets)",
+    "routed4": "Routed + LEARNED switch weight (Kendall uncertainty weighting, starts at 50, standard loss - no GradNorm)",
+    "routed5": "Routed + gradient-decoupled switch head (separate classifier, detached from backbone; switch_weight=50 fixed)",
+    "routed6": "Routed + 2x context (1024->2048), otherwise unchanged",
 }
 
 # arm="hybrid" only: fraction of training steps drawing a natural single-domain batch
