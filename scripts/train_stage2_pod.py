@@ -36,18 +36,26 @@ from src.model.mot_routed_combined_model import MoTRoutedCombinedModel
 from src.model.mot_routed_decoupled_model import MoTRoutedDecoupledModel
 from src.model.mot_routed_model import MoTRoutedModel
 from src.model.stage2_config import (
-    ADV_LAMBDA_RAMP_STEPS, ARM_LABELS, BACKBONE_ONLY_CFG, BATCH_SIZE, CHECKPOINT_EVERY,
-    CONFIDENCE_WEIGHT, FOCAL_GAMMA, GRAD_ACCUM_STEPS, HYBRID_NATURAL_DATA_FRACTION, LOG_EVERY,
-    LONGCTX_MODEL_CFG, LR, MAX_STEPS, MODEL_CFG, ROUTED3_MAX_DOMAINS, ROUTED3_MIN_DOMAINS,
-    ROUTED3_SNIPPET_WORDS, SWITCH_WEIGHT, WARMUP_STEPS,
+    ADV_LAMBDA_RAMP_STEPS, ARM_LABELS, BACKBONE_ONLY_CFG, BATCH_SIZE, BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS,
+    CHECKPOINT_EVERY, CONFIDENCE_WEIGHT, COOLDOWN_BACKBONE_LR_SCALE, FOCAL_GAMMA, GRAD_ACCUM_STEPS,
+    HYBRID_NATURAL_DATA_FRACTION, LOG_EVERY, LONGCTX_MODEL_CFG, LR, MAX_STEPS, MODEL_CFG,
+    ROUTED3_MAX_DOMAINS, ROUTED3_MIN_DOMAINS, ROUTED3_SNIPPET_WORDS, SWITCH_WEIGHT, WARM_START_PARENT,
+    WARMUP_STEPS,
 )
 
 TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2")
-# arm="routed7" only: nlp tokenizer retrained on OpenWebText (see
-# scripts/retrain_nlp_tokenizer_openwebtext.py) - must exist before routed7 can run.
-# code/math/science still load from TOKENIZER_DIR above, unchanged.
+# arm in ("routed7", "routed8"): nlp tokenizer retrained on OpenWebText (see
+# scripts/retrain_nlp_tokenizer_openwebtext.py). code/math/science still load from
+# TOKENIZER_DIR above, unchanged.
 OWT_NLP_TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2_owt" / "nlp")
+# arm in ("routed9", "routed10"): nlp tokenizer retrained on PG-19 books (see
+# scripts/retrain_nlp_tokenizer_books.py).
+BOOKS_NLP_TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2_books" / "nlp")
 CKPT_DIR = REPO_ROOT / "checkpoints"
+# arms routed9/routed10 only: state_dict key prefixes that are nlp-domain-specific and must
+# be reinitialized (not warm-started) when switching to a differently-fit nlp tokenizer - see
+# _warm_start_from_parent.
+_NLP_PARAM_PREFIXES = ("embeddings.nlp.", "type_embeddings.nlp.", "projections.nlp.", "heads.nlp.")
 
 
 def _hybrid_batch(step: int, domains: list[str], domain_index: dict[str, int],
@@ -104,6 +112,58 @@ def _apply_openwebtext_nlp_source() -> None:
     print("[routed7] nlp domain source overridden: FineWeb -> Skylion007/openwebtext", flush=True)
 
 
+def _apply_books_nlp_source() -> None:
+    """arm in ("routed9", "routed10"): re-point the shared nlp domain to PG-19 (Project
+    Gutenberg books) instead of FineWeb/OpenWebText. LAMBADA's passages are themselves
+    book-derived, and the long-range antecedent->target copying it tests is a skill short web
+    pages rarely train, unlike continuous book narrative - see docs/handoff_optimized_89m_190m.md.
+    code/math/science untouched, same rationale as _apply_openwebtext_nlp_source. PG-19's row
+    schema uses the same "text" field (confirmed by direct test), so TEXT_EXTRACTORS["nlp"]
+    needs no changes.
+    """
+    from src.model import stage2_config
+    stage2_config.STREAM_SOURCES["nlp"] = {
+        "path": "deepmind/pg19", "name": None, "gated": False,
+    }
+    print("[routed9/10] nlp domain source overridden: FineWeb -> deepmind/pg19", flush=True)
+
+
+def _warm_start_from_parent(model, parent_ckpt_prefix: str, device: str) -> bool:
+    """arms routed9/routed10: initialize from the parent arm's latest checkpoint instead of
+    random init, EXCEPT the nlp domain's embedding/type_embedding/projection/head. Those
+    describe token ids under the PARENT's nlp tokenizer (FineWeb- or OpenWebText-fit) - a
+    different vocabulary than routed9/routed10's PG-19-fit tokenizer, even though the tensor
+    SHAPES match (same NLP_*_VOCAB constants everywhere). Loading them would be confidently
+    wrong, not just stale, so they're left at fresh random init instead. The shared backbone
+    and code/math/science tables are untouched by the nlp tokenizer swap and transfer directly.
+    """
+    import glob
+    import re
+    paths = glob.glob(str(CKPT_DIR / f"{parent_ckpt_prefix}_step*.pt"))
+    if not paths:
+        print(f"WARNING: no parent checkpoint found for prefix '{parent_ckpt_prefix}' in "
+              f"{CKPT_DIR} - starting from random init instead of a warm start", flush=True)
+        return False
+    latest = sorted(paths, key=lambda p: int(re.search(r"step(\d+)", p).group(1)), reverse=True)[0]
+    parent_ckpt = torch.load(latest, map_location=device)
+    parent_state = parent_ckpt["model"]
+    own_state = model.state_dict()
+    loaded, skipped = 0, 0
+    for k, v in parent_state.items():
+        if k.startswith(_NLP_PARAM_PREFIXES):
+            skipped += 1
+            continue
+        if k in own_state and own_state[k].shape == v.shape:
+            own_state[k] = v
+            loaded += 1
+        else:
+            print(f"  warm-start: key '{k}' missing/shape-mismatched in child model, skipping", flush=True)
+    model.load_state_dict(own_state)
+    print(f"warm-started from {latest} (parent step {parent_ckpt['step']}): "
+          f"{loaded} tensors loaded, {skipped} nlp-domain tensors left at fresh init", flush=True)
+    return True
+
+
 def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "base"):
     # scale="large" (arms mot/baseline only, for the scale test) swaps the whole config for
     # LARGE_MODEL_CFG - ~3-4x params. Everything else about the run is identical, which is the
@@ -120,12 +180,16 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
             return MoTHybridModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LARGE_MODEL_CFG).to(device)
         if arm == "routed7":  # routed, same architecture, nlp domain sourced from OpenWebText (see _apply_openwebtext_nlp_source)
             return MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LARGE_MODEL_CFG).to(device)
-        raise ValueError(f"scale=large supports mot/baseline/routed/routed3/routed7, not {arm}")
+        if arm == "routed10":  # routed7's pair - same architecture, warm-started + books + upweighted (see _warm_start_from_parent)
+            return MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LARGE_MODEL_CFG).to(device)
+        raise ValueError(f"scale=large supports mot/baseline/routed/routed3/routed7/routed10, not {arm}")
     if arm == "mot":
         return MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    if arm in ("routed", "routed8"):
-        # routed8: identical architecture to plain routed - only the nlp data source (applied
-        # by _apply_openwebtext_nlp_source, called from calibrate()/train()) differs.
+    if arm in ("routed", "routed8", "routed9"):
+        # routed8/routed9: identical architecture to plain routed - only the nlp data source
+        # (OpenWebText or PG-19 books, applied by _apply_openwebtext_nlp_source /
+        # _apply_books_nlp_source in calibrate()/train()) and, for routed9, the warm-start +
+        # mixture upweighting, differ.
         return MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     if arm == "pooled":
         return MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
@@ -157,13 +221,16 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
 def calibrate(arm: str, steps: int, scale: str = "base") -> float:
     device = "cuda"
     print(f"CUDA available: {torch.cuda.is_available()}  device: {torch.cuda.get_device_name(0)}", flush=True)
-    if arm == "routed7":
+    if arm in ("routed7", "routed10"):
         scale = "large"  # always large-scale, regardless of what --scale was passed
     if arm in ("routed7", "routed8"):
         _apply_openwebtext_nlp_source()
+    if arm in ("routed9", "routed10"):
+        _apply_books_nlp_source()
 
-    bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR,
-                              nlp_tokenizer_dir=OWT_NLP_TOKENIZER_DIR if arm in ("routed7", "routed8") else None)
+    nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in ("routed7", "routed8") else \
+        (BOOKS_NLP_TOKENIZER_DIR if arm in ("routed9", "routed10") else None)
+    bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR, nlp_tokenizer_dir=nlp_tok_dir)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     model = _build_model(arm, bundle, device, scale)
     print(f"{arm} ({scale}) params: {model.num_params():,}", flush=True)
@@ -176,7 +243,12 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             d: iter(DataLoader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
-    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8"):
+    if arm in ("routed9", "routed10"):
+        loader = iter(DataLoader(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"],
+            force_domain="nlp", force_domain_snippet_words=BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS,
+        ), batch_size=BATCH_SIZE))
+    elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8"):
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
         loader = iter(DataLoader(PackedRoutedStream(
@@ -211,7 +283,7 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
-        elif arm in ("routed", "pooled", "pooled2", "routed5", "routed6", "routed7", "routed8"):
+        elif arm in ("routed", "pooled", "pooled2", "routed5", "routed6", "routed7", "routed8", "routed9", "routed10"):
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
@@ -248,18 +320,34 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     total_steps = max_steps or MAX_STEPS
     print(f"device: {torch.cuda.get_device_name(0)}  arm: {arm}  steps: {total_steps}", flush=True)
     print(f"ARM: {arm}  =  {ARM_LABELS.get(arm, arm)}", flush=True)
-    if arm == "routed7":
+    if arm in ("routed7", "routed10"):
         scale = "large"  # always large-scale, regardless of what --scale was passed
     if arm in ("routed7", "routed8"):
         _apply_openwebtext_nlp_source()
+    if arm in ("routed9", "routed10"):
+        _apply_books_nlp_source()
 
-    bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR,
-                              nlp_tokenizer_dir=OWT_NLP_TOKENIZER_DIR if arm in ("routed7", "routed8") else None)
+    nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in ("routed7", "routed8") else \
+        (BOOKS_NLP_TOKENIZER_DIR if arm in ("routed9", "routed10") else None)
+    bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR, nlp_tokenizer_dir=nlp_tok_dir)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     model = _build_model(arm, bundle, device, scale)
     print(f"{arm} ({scale}) params: {model.num_params():,}", flush=True)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=LR)
+    # routed9/routed10 ("cooldown" arms): the nlp branch is reinitialized fresh (see
+    # _warm_start_from_parent) while everything else is warm-started, so it needs to catch up
+    # fast without the warm-started backbone/other-domain tables being dragged along at the
+    # same rate - COOLDOWN_BACKBONE_LR_SCALE (0.1) throttles the latter, applied per-step below
+    # alongside the normal cosine schedule via each param group's "lr_scale".
+    if arm in WARM_START_PARENT:
+        nlp_params = [p for n, p in model.named_parameters() if n.startswith(_NLP_PARAM_PREFIXES)]
+        other_params = [p for n, p in model.named_parameters() if not n.startswith(_NLP_PARAM_PREFIXES)]
+        opt = torch.optim.AdamW([
+            {"params": nlp_params, "lr_scale": 1.0},
+            {"params": other_params, "lr_scale": COOLDOWN_BACKBONE_LR_SCALE},
+        ], lr=LR)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=LR)
     scaler = torch.amp.GradScaler("cuda")
 
     CKPT_DIR.mkdir(exist_ok=True)
@@ -272,6 +360,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         return sorted(paths, key=lambda p: int(re.search(r"step(\d+)", p).group(1)), reverse=True)
 
     start_step = 1
+    resumed_own = False
     for cand in _latest_checkpoint():
         try:
             ckpt = torch.load(cand, map_location=device)
@@ -279,12 +368,15 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             opt.load_state_dict(ckpt["opt"])
             start_step = ckpt["step"] + 1
             print(f"resumed from {cand} at step {start_step}", flush=True)
+            resumed_own = True
             break
         except Exception as e:
             print(f"checkpoint {cand} failed to load ({type(e).__name__}: {e}); trying older", flush=True)
             continue
-    else:
-        print(f"no checkpoint found for {arm} in {CKPT_DIR} - starting from step 1", flush=True)
+    if not resumed_own:
+        warm_started = arm in WARM_START_PARENT and _warm_start_from_parent(model, WARM_START_PARENT[arm], device)
+        if not warm_started:
+            print(f"no checkpoint found for {arm} in {CKPT_DIR} - starting from step 1", flush=True)
 
     def lr_at(step: int) -> float:
         if step < WARMUP_STEPS:
@@ -298,7 +390,12 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             d: iter(DataLoader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
-    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8"):
+    if arm in ("routed9", "routed10"):
+        loader = iter(DataLoader(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"],
+            force_domain="nlp", force_domain_snippet_words=BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS,
+        ), batch_size=BATCH_SIZE))
+    elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8"):
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
         loader = iter(DataLoader(PackedRoutedStream(
@@ -331,14 +428,18 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     from src.model.stage2_config import EVAL_EVERY, VAL_BATCHES, VAL_SEED
 
     val_iter = None
-    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4", "routed5", "routed6", "routed7", "routed8"):
+    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4", "routed5",
+               "routed6", "routed7", "routed8", "routed9", "routed10"):
         rs3 = arm == "routed3"
+        upweighted = arm in ("routed9", "routed10")
         seq_len = LONGCTX_MODEL_CFG["max_seq_len"] if arm in ("routed4", "routed6") else MODEL_CFG["max_seq_len"]
         val_stream = PackedRoutedStream(
             bundle, domain_index, seq_len, seed=VAL_SEED,
             min_domains=ROUTED3_MIN_DOMAINS if rs3 else 2,
             max_domains=ROUTED3_MAX_DOMAINS if rs3 else 4,
             snippet_words=ROUTED3_SNIPPET_WORDS if rs3 else 250,
+            force_domain="nlp" if upweighted else None,
+            force_domain_snippet_words=BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS if upweighted else None,
         )
         val_iter = iter(DataLoader(val_stream, batch_size=BATCH_SIZE))
 
@@ -369,7 +470,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     for step in range(start_step, total_steps + 1):
         lr_mult = controller.lr_mult if controller is not None else 1.0
         for g in opt.param_groups:
-            g["lr"] = LR * lr_at(step) * lr_mult
+            g["lr"] = LR * lr_at(step) * lr_mult * g.get("lr_scale", 1.0)
 
         if arm == "mot":
             domain = domains[step % len(domains)]
@@ -379,7 +480,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             with torch.autocast("cuda"):
                 logits = model(domain, inp, types[:, :-1])
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
-        elif arm in ("routed", "routed7", "routed8"):
+        elif arm in ("routed", "routed7", "routed8", "routed9", "routed10"):
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
@@ -474,7 +575,8 @@ if __name__ == "__main__":
     parser.add_argument("mode", choices=["calibrate", "train"])
     parser.add_argument("--arm", required=True,
                          choices=["mot", "baseline", "sota", "routed", "pooled", "hybrid", "pooled2",
-                                  "routed2", "routed3", "routed4", "routed5", "routed6", "routed7", "routed8"])
+                                  "routed2", "routed3", "routed4", "routed5", "routed6", "routed7",
+                                  "routed8", "routed9", "routed10"])
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--scale", choices=["base", "large"], default="base",
                          help="'large' (mot/baseline only) uses LARGE_MODEL_CFG for the scale test")

@@ -35,7 +35,7 @@ def main(out_dir: str, n_sample: int) -> None:
 
     sample_dir = f"{out_dir}/_sample"
     print(f"sampling {n_sample} OpenWebText docs for nlp tokenizer training -> {sample_dir}/nlp", flush=True)
-    sample_domain("nlp", out_dir=sample_dir)
+    sample_domain("nlp", out_dir=sample_dir, n_docs=n_sample)
 
     from datasets import load_from_disk
     texts = [r["text"] for r in load_from_disk(f"{sample_dir}/nlp")]

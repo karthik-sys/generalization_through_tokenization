@@ -146,6 +146,13 @@ ARM_LABELS = {
                "to 600k steps: both target ~10B tokens/domain (llm.c's dedicated-GPT-2-124M-training "
                "budget), testing whether per-domain token-volume equivalence matters independent of "
                "model scale",
+    "routed9": "Routed, BASE (champion) scale, warm-started from the routed champion checkpoint - "
+               "nlp sourced from PG-19 books (not OWT), upweighted to ~55% of the token mixture, "
+               "nlp embedding/head reinitialized (new vocab), backbone+other domains at 0.1x LR "
+               "('cooldown', 50k steps) - targets LAMBADA specifically via book-narrative data and "
+               "mixture share, not just data-source matching or raw volume",
+    "routed10": "Routed, LARGE scale, warm-started from routed7's checkpoint - same books/upweight/"
+               "cooldown treatment as routed9, at large scale. routed9's large-scale pair.",
 }
 
 # routed7 (extended) and routed8 target ~600,000 steps rather than the usual 150,000. At
@@ -155,6 +162,27 @@ ARM_LABELS = {
 # (github.com/karpathy/llm.c) needed ~10B tokens dedicated to ONE domain to reach GPT-2's real
 # reported performance - 4x closes that gap for every domain at once, not just nlp.
 DATA_EQUIVALENT_STEPS = 600000
+
+# routed9 (base/champion, 89M) and routed10 (large, 190M): warm-started continued-training
+# ("cooldown") runs, not from-scratch. Both (a) source nlp from PG-19 books instead of
+# OpenWebText/FineWeb - LAMBADA's passages are themselves book-derived, and the long-range
+# antecedent->target copying it tests is a skill short web pages rarely exercise, unlike
+# continuous book narrative; (b) upweight nlp's share of the mixture via force_domain in
+# stage2_routed_stream.py - guaranteed presence + a longer snippet lands nlp at ~55% of
+# tokens (see that module's docstring for the arithmetic), vs the ~25% every other arm gets;
+# (c) warm-start from the existing champion/routed7 checkpoint rather than random init,
+# reinitializing ONLY the nlp domain's embedding/type_embedding/projection/head (a new
+# tokenizer vocabulary means those params' learned weights describe the WRONG content now,
+# worse than random - see _warm_start_from_parent in train_stage2_pod.py), keeping the
+# shared backbone and code/math/science tables exactly as trained.
+# Values are checkpoint-file PREFIXES (not arm names) - routed10's parent (routed7) trains at
+# large scale, so its checkpoints are named "large_routed7_step*.pt", not "routed7_step*.pt".
+WARM_START_PARENT = {"routed9": "routed", "routed10": "large_routed7"}
+COOLDOWN_STEPS = 50000  # ~1/3 of a full run - cheap, and the backbone is already trained
+COOLDOWN_BACKBONE_LR_SCALE = 0.1  # warm-started params (everything but nlp) train 10x slower
+                                    # than the freshly-reinitialized nlp branch, so the cooldown
+                                    # doesn't undo what the parent checkpoint already learned
+BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS = 600  # vs the other domains' default SNIPPET_WORDS=250
 
 # arm="hybrid" only: fraction of training steps drawing a natural single-domain batch
 # (PackedDomainStream, long continuous context - what MoT trains on exclusively) rather than

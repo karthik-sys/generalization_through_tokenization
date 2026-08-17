@@ -21,7 +21,7 @@ from src.model.stage2_config import STREAM_SOURCES
 N_SAMPLE = 50000  # docs per domain, enough for a stable 24k-32k BPE vocab without downloading full shards
 
 
-def sample_domain(domain: str, out_dir: str = "data/stage2_tokenizer_sample") -> None:
+def sample_domain(domain: str, out_dir: str = "data/stage2_tokenizer_sample", n_docs: int = N_SAMPLE) -> None:
     cfg = STREAM_SOURCES[domain]
     if cfg.get("gated"):
         print(f"{domain}: source is gated ({cfg['path']}) - accept its terms on huggingface.co and run "
@@ -32,7 +32,7 @@ def sample_domain(domain: str, out_dir: str = "data/stage2_tokenizer_sample") ->
         split="train", streaming=True,
     )
     rows = []
-    for row in itertools.islice(stream, N_SAMPLE):
+    for row in itertools.islice(stream, n_docs):
         text = TEXT_EXTRACTORS[domain](row)
         if text:
             rows.append({"text": text})

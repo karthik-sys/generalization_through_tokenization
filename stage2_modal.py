@@ -606,6 +606,13 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     elif arm == "routed8":
         # routed8 stays BASE scale (unlike routed7) - only the nlp source override applies.
         STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
+    elif arm == "routed10":
+        MODEL_CFG = LARGE_MODEL_CFG  # routed10 is always large-scale, regardless of --scale
+        scale = "large"
+        STREAM_SOURCES["nlp"] = {"path": "deepmind/pg19", "name": None, "gated": False}
+    elif arm == "routed9":
+        # routed9 stays BASE scale (unlike routed10) - only the nlp source override applies.
+        STREAM_SOURCES["nlp"] = {"path": "deepmind/pg19", "name": None, "gated": False}
     elif scale == "large":
         MODEL_CFG = LARGE_MODEL_CFG
     BACKBONE_ONLY_CFG = LARGE_BACKBONE_ONLY_CFG if scale == "large" else BACKBONE_ONLY_CFG
@@ -774,15 +781,17 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
 
     bundle = TokenizerBundle(
         tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
-        nlp_tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp" if arm in ("routed7", "routed8") else None,
+        nlp_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp" if arm in ("routed7", "routed8") else
+                            (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None)),
     )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
-    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4", "routed7", "routed8")  # arms with disjoint per-domain heads
+    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4",
+                             "routed7", "routed8", "routed9", "routed10")  # arms with disjoint per-domain heads
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    elif arm in ("routed", "routed7", "routed8"):
+    elif arm in ("routed", "routed7", "routed8", "routed9", "routed10"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "pooled":
         model = MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
@@ -1016,6 +1025,11 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
         # from the fixed EleutherAI/lambada_openai benchmark, never from STREAM_SOURCES)
     elif arm == "routed8":
         pass  # routed8 stays BASE scale - only the nlp tokenizer dir below differs
+    elif arm == "routed10":
+        MODEL_CFG = LARGE_MODEL_CFG  # routed10 is always large-scale, regardless of --scale
+        scale = "large"
+    elif arm == "routed9":
+        pass  # routed9 stays BASE scale - only the nlp tokenizer dir below differs
     elif scale == "large":
         MODEL_CFG = LARGE_MODEL_CFG
     BACKBONE_ONLY_CFG = LARGE_BACKBONE_ONLY_CFG if scale == "large" else BACKBONE_ONLY_CFG
@@ -1023,15 +1037,17 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     seq_len = MODEL_CFG["max_seq_len"]
     bundle = TokenizerBundle(
         tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
-        nlp_tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp" if arm in ("routed7", "routed8") else None,
+        nlp_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp" if arm in ("routed7", "routed8") else
+                            (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None)),
     )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
-    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4", "routed7", "routed8")
+    domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4",
+                             "routed7", "routed8", "routed9", "routed10")
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    elif arm in ("routed", "routed7", "routed8"):
+    elif arm in ("routed", "routed7", "routed8", "routed9", "routed10"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "pooled":
         model = MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
