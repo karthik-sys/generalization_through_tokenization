@@ -1037,7 +1037,56 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
 
     import math
     LN2 = math.log(2)
-    n_correct, n_scored, n_skipped = 0, 0, 0
+
+    # GPT-2's published LAMBADA numbers (Radford et al. 2019) used a "stop-word filter":
+    # common function words (the/a/and/of/...) are excluded from the model's candidate guess
+    # for the target word, since LAMBADA's real targets are essentially never plain stopwords
+    # - without the filter GPT-2's raw exact-match was 52.66%, with it 63.24% (their own
+    # reported delta). Our primary `accuracy` above is the UNFILTERED, stricter number (every
+    # sub-word piece of the answer must match exactly, no stopword exclusion) - it is NOT the
+    # same thing GPT-2's headline figures measure. This computes the matched-methodology
+    # number as a SEPARATE, additional metric so a comparison to their published numbers has
+    # something to actually stand on, without touching the primary metric already recorded
+    # for every other arm this session.
+    #
+    # This is our own reconstruction of their filter (the exact word list was never published
+    # by OpenAI) - treat it as an approximation of their approximation, not a certified match.
+    _STOPWORDS = [
+        "the", "a", "an", "and", "or", "but", "if", "of", "to", "in", "on", "at", "by",
+        "for", "with", "as", "is", "was", "were", "are", "be", "been", "being", "it",
+        "its", "this", "that", "these", "those", "he", "she", "they", "we", "you", "i",
+        "his", "her", "their", "our", "your", "my", "him", "them", "us", "me", "not",
+        "no", "so", "up", "out", "about", "into", "over", "after", "before", "than",
+        "then", "there", "here", "what", "which", "who", "when", "where", "how", "all",
+        "any", "each", "other", "some", "such", "only", "own", "same", "too", "very",
+        "just", "also", "one", "would", "could", "should", "will", "shall", "can", "may",
+        "might", "must", "do", "does", "did", "have", "has", "had", "from",
+    ]
+
+    def _stopword_token_ids(enc_fn) -> set[int]:
+        """Single-token encodings only - a multi-piece "stopword" can't collide with a
+        single-position first-token argmax the same way, and most true function words are
+        single tokens in any reasonable BPE-family vocab anyway."""
+        ids = set()
+        for w in _STOPWORDS:
+            for variant in (w, " " + w, w.capitalize(), " " + w.capitalize()):
+                try:
+                    enc = enc_fn(variant, max_len=10**9)
+                    tok_ids = enc[0] if isinstance(enc, tuple) else enc
+                    if len(tok_ids) == 1:
+                        ids.add(int(tok_ids[0]))
+                except Exception:
+                    continue
+        return ids
+
+    if domain_routed:
+        stopword_ids = _stopword_token_ids(lambda t, max_len: bundle.encode_domain("nlp", t, max_len=max_len))
+    else:
+        stopword_ids = _stopword_token_ids(encode_fn)
+    stopword_id_tensor = torch.tensor(sorted(stopword_ids), dtype=torch.long, device=device) if stopword_ids else None
+    print(f"stop-word filter: {len(stopword_ids)} single-token stopword ids identified for {arm}'s tokenizer", flush=True)
+
+    n_correct, n_correct_filtered, n_scored, n_skipped = 0, 0, 0, 0
     total_nats, total_target_tokens = 0.0, 0
     with torch.no_grad():
         for i, row in enumerate(ds):
@@ -1097,6 +1146,22 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
             true_ids = full_ids[0, n_ctx:]
             correct = torch.equal(pred_ids[: len(true_ids)], true_ids)
             n_correct += int(correct)
+
+            # Stop-word-filtered variant (see note above the loop): only the FIRST target
+            # token's guess is filtered - that's the "which word" decision the stopword
+            # heuristic targets. Any remaining sub-word pieces still use the plain (unfiltered)
+            # argmax, same as the primary metric, since filtering isn't meaningful once the
+            # first piece has already picked a specific word.
+            if stopword_id_tensor is not None:
+                first_logits = target_logits[0].clone()
+                first_logits[stopword_id_tensor] = float("-inf")
+                filtered_first = int(first_logits.argmax())
+            else:
+                filtered_first = int(pred_ids[0])
+            filtered_pred_ids = pred_ids.clone()
+            filtered_pred_ids[0] = filtered_first
+            correct_filtered = torch.equal(filtered_pred_ids[: len(true_ids)], true_ids)
+            n_correct_filtered += int(correct_filtered)
             n_scored += 1
 
             # Perplexity/BPB-style score on the target word's tokens - a continuous signal
@@ -1116,6 +1181,7 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
                       f"target-token ppl={running_ppl:.1f}", flush=True)
 
     accuracy = n_correct / max(n_scored, 1)
+    accuracy_stopword_filtered = n_correct_filtered / max(n_scored, 1)
     target_ppl = math.exp(total_nats / max(total_target_tokens, 1))
     target_bpb = (total_nats / LN2) / max(total_target_tokens, 1)  # nats->bits per target TOKEN, not byte -
     # LAMBADA targets are single words of varying byte length, so this is bits/token not a
@@ -1123,9 +1189,11 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     # definition for everyone, same spirit as why plain BPB divides by bytes instead of tokens
     # for domain text - here the "unit" being predicted (one target word) is already fixed.
     print(f"\nLAMBADA for {arm} (checkpoint step {ckpt['step']}): "
-          f"exact-match accuracy={accuracy:.4f} ({n_correct}/{n_scored} scored, {n_skipped} skipped)  "
+          f"exact-match accuracy={accuracy:.4f}  stop-word-filtered accuracy={accuracy_stopword_filtered:.4f}  "
+          f"({n_correct}/{n_scored} scored, {n_skipped} skipped)  "
           f"target-token perplexity={target_ppl:.2f}  bits/target-token={target_bpb:.3f}", flush=True)
-    return {"accuracy": accuracy, "target_token_ppl": target_ppl, "bits_per_target_token": target_bpb,
+    return {"accuracy": accuracy, "accuracy_stopword_filtered": accuracy_stopword_filtered,
+            "target_token_ppl": target_ppl, "bits_per_target_token": target_bpb,
             "n_scored": n_scored, "n_skipped": n_skipped}
 
 
@@ -1294,6 +1362,7 @@ def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from:
     elif step == "evaluate-lambada":
         result = evaluate_lambada.remote(arm=arm, checkpoint_step=steps or 150000, scale=scale)
         print(f"\nLAMBADA for {arm}: accuracy={result['accuracy']:.4f}  "
+              f"stop-word-filtered accuracy={result['accuracy_stopword_filtered']:.4f}  "
               f"target-token ppl={result['target_token_ppl']:.2f}  "
               f"bits/target-token={result['bits_per_target_token']:.3f}")
     elif step == "generate":
