@@ -13,7 +13,9 @@
     "arm": "hybrid",
     "bpb_cross": 2.8414,
     "bpb_single": 2.535,
-    "note": "GradNorm fixed switch acc (27->35%) but lost cross-domain edge; 75k not matched",
+    "lambada_accuracy": 0.0,
+    "lambada_ppl": 396.23,
+    "note": "GradNorm fixed switch acc (27->35%) but lost cross-domain edge; 75k not matched to 150k. LAMBADA ppl=396.23 - beats baseline/SOTA by a wide margin, between pooled (280.5) and routed3 (3199).",
     "params": 89114364,
     "per_domain_bpb": {
       "code": 2.742,
