@@ -55,6 +55,11 @@ td.num{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:righ
 .legend i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:6px;vertical-align:middle}
 .variants{margin-top:10px;padding-top:10px;border-top:1px dashed var(--border2);font-family:var(--mono);font-size:10.5px;line-height:1.6;color:var(--text3)}
 .variants b{color:var(--text2);font-weight:500}
+.loss-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:12px}
+.loss-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 14px}
+.loss-card-title{font-size:12.5px;font-weight:500;margin-bottom:6px}
+.loss-card .pt{cursor:pointer}
+.loss-tooltip{position:fixed;pointer-events:none;background:var(--surface);border:1px solid var(--border2);border-radius:6px;padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--text);box-shadow:0 2px 8px rgba(0,0,0,0.15);z-index:100;white-space:nowrap}
 .finding{border-left:3px solid var(--mot);padding:2px 0 2px 14px;margin:14px 0}
 .finding b{color:var(--text)}
 a{color:var(--mot)}
@@ -212,15 +217,8 @@ from …</div>
 </div>
 
 <h2>Live arms — loss trend <small class='mono' style='color:var(--text3);font-weight:400'>({{UPDATED}})</small></h2>
-<p class="note" style="margin-top:2px">The in-flight variants sum several weighted loss terms (GradNorm-balanced), so their raw loss isn't on the same scale as the archived arms above, or even directly against each other. Each line here is normalized to <b>that arm's own</b> early loss (avg of its first 3 logged points = 1.0x) — this shows convergence <i>shape</i>, not a ranking.</p>
-<div class="card" style="margin-top:12px">
-<div class="legend">
-{{LIVE_LOSS_LEGEND}}
-</div>
-<div style="overflow-x:auto">
-{{LIVE_LOSS_SVG}}
-</div>
-</div>
+<p class="note" style="margin-top:2px">One chart per arm, each scaled to <b>its own</b> step and loss range — not a shared axis. Hover (or tap) a point for its exact step/loss. Values aren't comparable arm-to-arm: the GradNorm variants sum different weighted loss terms, so this is a per-arm health check, not a ranking. A short x-range with a note below it means that arm's log only covers time since its last manual restart — training logs get overwritten (not appended) on resume, so earlier history isn't recoverable from the log alone.</p>
+{{LIVE_LOSS_CARDS}}
 
 <h2>In flight now — live pod status <small class='mono' style='color:var(--text3);font-weight:400'>({{UPDATED}})</small></h2>
 <p class="note" style="margin-top:2px">Each targets one diagnosed weakness, not "more scale." All at 75k steps (the new default for exploratory runs), live on dedicated RunPod A40s.</p>
@@ -240,7 +238,40 @@ from …</div>
 <div class="finding"><b>Open question — does it survive scale?</b> Every result is at 68–122M params, exactly where tokenizer-specialization effects show strongest. The next real bet is a matched MoT-vs-baseline pair at 350M–1B to see if the gap holds or shrinks. Being thoughtful before spending there.</div>
 
 <p class="note" style="margin-top:34px;border-top:1px solid var(--border);padding-top:16px">
-Infra: Modal (eval + volume) + 8× RunPod A40 pods (training). Code: <span class="mono">karthik-sys/generalization_through_tokenization</span>. Snapshot regenerated from live pod status + checkpoint history — not a live feed (a sandboxed artifact can't poll the pods).
+Infra: Modal (eval) + 8× RunPod A40 pods (training). Code: <span class="mono">karthik-sys/generalization_through_tokenization</span>. Auto-refreshed every ~10 min from live pod SSH status (a sandboxed artifact can't poll the pods itself, so a scheduled job pulls state and republishes this page).
 </p>
 
 </div>
+
+<script>
+(function(){
+  var tip = document.getElementById('lossTooltip');
+  if (!tip) return;
+  document.querySelectorAll('.loss-card svg').forEach(function(svg){
+    var hoverDot = svg.querySelector('.hover-dot');
+    svg.querySelectorAll('.pt').forEach(function(pt){
+      pt.addEventListener('mouseenter', function(e){ show(pt, e); });
+      pt.addEventListener('mousemove', function(e){ show(pt, e); });
+      pt.addEventListener('touchstart', function(e){ show(pt, e.touches[0]); e.preventDefault(); }, {passive:false});
+    });
+    svg.addEventListener('mouseleave', function(){
+      tip.style.display = 'none';
+      if (hoverDot) hoverDot.style.display = 'none';
+    });
+    function show(pt, e){
+      var step = pt.getAttribute('data-step');
+      var loss = pt.getAttribute('data-loss');
+      tip.textContent = 'step ' + Number(step).toLocaleString() + '  ·  loss ' + loss;
+      tip.style.display = 'block';
+      var pageX = e.clientX, pageY = e.clientY;
+      tip.style.left = (pageX + 12) + 'px';
+      tip.style.top = (pageY - 10) + 'px';
+      if (hoverDot) {
+        hoverDot.setAttribute('cx', pt.getAttribute('cx'));
+        hoverDot.setAttribute('cy', pt.getAttribute('cy'));
+        hoverDot.style.display = 'block';
+      }
+    }
+  });
+})();
+</script>
