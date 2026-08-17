@@ -20,7 +20,11 @@ app = modal.App("mot-stage2")
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "datasets>=2.19",
+        # pinned exactly (not >=) - newer datasets releases dropped trust_remote_code support
+        # entirely ("trust_remote_code is not supported anymore"), which pg19's legacy
+        # loading-script format needs. Matches the training pods' installed version (verified:
+        # pip show datasets -> 2.19.0), so eval reads the same data the way training did.
+        "datasets==2.19.0",
         "tokenizers>=0.19",
         "sentencepiece>=0.2",
         "morfessor>=2.0",
