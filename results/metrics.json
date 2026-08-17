@@ -9,6 +9,24 @@
     "scale": "base",
     "step": 150000
   },
+  "hybrid@150000": {
+    "arm": "hybrid",
+    "bpb_cross": 2.7914,
+    "bpb_single": 2.4936,
+    "lambada_accuracy": 0.0,
+    "lambada_ppl": 380.9,
+    "note": "Matched to 150k (was 75k). Modest improvement across the board vs 75k: BPB single 2.535->2.494, cross 2.841->2.791, LAMBADA ppl 396->381. Switch acc flat (34.85%->34.35%, noise). More steps helped a little but did not change the ranking.",
+    "params": 89114364,
+    "per_domain_bpb": {
+      "code": 2.6752,
+      "math": 2.934,
+      "nlp": 2.5111,
+      "science": 1.9834
+    },
+    "scale": "base",
+    "step": 150000,
+    "switch_accuracy": 0.3435
+  },
   "hybrid@75000": {
     "arm": "hybrid",
     "bpb_cross": 2.8414,
