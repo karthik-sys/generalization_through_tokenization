@@ -7,6 +7,7 @@ on granularity as well as identity (spec §6): SURFACE=0, SYLLABLE=1, MORPHEME=2
 """
 
 import json
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -53,6 +54,7 @@ def train_nlp_tokenizer(
         unk_id=UNK_ID,
         bos_id=BOS_ID,
         eos_id=EOS_ID,
+        num_threads=os.cpu_count() or 16,
     )
     tmp.unlink()
 

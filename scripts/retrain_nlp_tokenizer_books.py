@@ -45,7 +45,18 @@ def main(out_dir: str, n_sample: int) -> None:
     sample_domain("nlp", out_dir=sample_dir, n_docs=n_sample)
 
     from datasets import load_from_disk
-    texts = [r["text"] for r in load_from_disk(f"{sample_dir}/nlp")]
+    # PG-19 rows are whole books (avg ~400K-800K chars) - SentencePiece only needs enough text
+    # per book to capture its subword/syllable/morpheme statistics, not the full text, and
+    # fitting on all of it (3000 x ~400K+ chars = 1B+ chars) makes the unigram trainer's
+    # suffix-array substring-extraction step impractically slow (confirmed: still running after
+    # an hour on a real pod, vs. minutes for OpenWebText's naturally-short ~150-300M char
+    # corpus). Capping each book's FITTING sample to 30K chars (~5K words, still clearly
+    # book-length narrative, not a web snippet) brings total corpus size back into the same
+    # regime OpenWebText's tokenizer fit quickly at. This only affects what the tokenizer is
+    # FIT on - actual training still streams full, untruncated PG-19 books via
+    # _apply_books_nlp_source in train_stage2_pod.py.
+    MAX_CHARS_PER_DOC = 30_000
+    texts = [r["text"][:MAX_CHARS_PER_DOC] for r in load_from_disk(f"{sample_dir}/nlp")]
     print(f"training nlp hybrid tokenizer on {len(texts)} PG-19 docs "
           f"(surface={NLP_SURFACE_VOCAB}, syllable={NLP_SYLLABLE_VOCAB}, morpheme={NLP_MORPHEME_VOCAB})",
           flush=True)
