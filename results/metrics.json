@@ -254,6 +254,78 @@
     "scale": "large",
     "step": 100000
   },
+  "routed15@100000": {
+    "arm": "routed15",
+    "bpb_cross": 1.1213,
+    "bpb_single": 2.0729,
+    "lambada_accuracy": 0.066,
+    "lambada_ppl": 18.99,
+    "note": "Round 2, Recipe 1 (control - no new module, flat 0.3x LR on 100% of params), 100k/100k continued training from routed8@600000, identical architecture to routed8 (97 tensors loaded, 0 skipped at warm-start). RESOLVES round 1s open question: EM 6.60% (6.80% filtered), ppl 18.99 - within noise of routed12 (deep-experts, EM 6.60%, ppl 18.99) and routed13 (precision-head, EM 6.60%, ppl 18.94). Confirms the handoff docs prediction exactly: routed12/13s small gains over routed8@600k (6.40%->6.60% EM, 19.13->~19.0 ppl) were NOT from their respective mechanisms (LoRA deep experts, margin-trained precision head) - a plain continuation of training with no new module at all reproduces the same improvement. The real lever in round 1 was just 100k more steps of stable training on the existing architecture, not either bet-specific mechanism. Also matches round 2s pattern: routed17/18 (diet phase 2, EM 9.80%, ppl ~17.1) clear this control baseline by a wide margin, confirming the data-distribution lever is real and substantially larger than continued-training-alone, unlike round 1s two mechanism bets.",
+    "params": 89114364,
+    "per_domain_bpb": {
+      "code": 1.1917,
+      "math": 2.342,
+      "nlp": 2.4916,
+      "science": 2.2732
+    },
+    "scale": "base",
+    "step": 100000,
+    "switch_accuracy": 0.2723
+  },
+  "routed16@100000": {
+    "arm": "routed16",
+    "bpb_cross": 1.1248,
+    "bpb_single": 2.0922,
+    "lambada_accuracy": 0.064,
+    "lambada_ppl": 19.13,
+    "note": "Round 2, Recipe 2 (copy-gate v2 - genuinely frozen backbone/vocab head via requires_grad=False, gate bias init -4.0), 100k/100k continued training from routed8@600000. CRITICAL FINDING: every number above is BYTE-IDENTICAL to routed8@600000 (BPB single 2.0922, cross 1.1248, switch_acc 0.2775, all 4 per-domain BPB values, LAMBADA EM 6.40%, ppl 19.13, to every decimal place recorded). Root cause traced and confirmed: stage2_modal.pys evaluate()/evaluate_lambada() always call the copy-gate model with targets=None (the inspection/generation code path), and MoTRoutedCopyGateModel.head_loss falls back entirely to the plain vocab head whenever targets is None (mot_routed_copygate_model.py:65-68) - so the copy_q/copy_k/copy_gate mechanism has NEVER been exercised by the official eval harness for ANY copy-gate arm (routed11, routed14, now routed16). Since routed16s backbone+vocab head are frozen and literally the same tensors as routed8@600000s, the eval pipeline reproduces routed8s numbers exactly, telling us NOTHING about whether the fixed (genuinely-frozen, negative-bias-init) copy mechanism actually helps. This also retroactively explains routed11/14s reported EM collapse: those numbers were always pure-vocab-head measurements too (consistent with diag_copygate.pys separately-measured vocab-only-accuracy of 2/60 and 0/60), not a measurement of the copy-blended distribution's output at all - the copy mechanism itself was never actually being scored by evaluate_lambada() in this whole bet. A real assessment of routed16 requires the same hand-built forward-pass approach as diag_copygate.py (or a harness fix to route targets through to _nlp_copy_gate_losses and read p_mix rather than plain vocab logits) - not built here, flagged as the clear next step before drawing any conclusion about routed16.",
+    "params": 89639364,
+    "per_domain_bpb": {
+      "code": 1.2026,
+      "math": 2.3785,
+      "nlp": 2.5141,
+      "science": 2.2833
+    },
+    "scale": "base",
+    "step": 100000,
+    "switch_accuracy": 0.2775
+  },
+  "routed17@100000": {
+    "arm": "routed17",
+    "bpb_cross": 1.1191,
+    "bpb_single": 1.8754,
+    "lambada_accuracy": 0.098,
+    "lambada_ppl": 17.14,
+    "note": "Round 2, Recipe 3 (diet phase 2 - nlp upweighted ~70%, no reinit), 100k/100k continued training from routed8@600000. REAL GAIN vs parent: EM 9.80% (11.40% stop-word-filtered) vs routed8s 6.40%, ppl 17.14 vs 19.13 - the largest LAMBADA improvement of any bet so far, round 1 included. Confirms the data-distribution lever (upweighting nlp share of tokens) keeps paying off a third time (after routed9/10s source-matching and volume levers), this time via mixture share alone with no tokenizer reinit. nlp per-domain BPB also dropped sharply (2.514 at routed8@600k -> 1.4047) as expected from far more nlp exposure; code/math/science BPB rose slightly (less exposure) but stayed usable. Cross-domain BPB improved too (1.1191 vs 1.1248), so no cross-domain crossing regression.",
+    "params": 89114364,
+    "per_domain_bpb": {
+      "code": 1.2196,
+      "math": 2.3958,
+      "nlp": 1.4047,
+      "science": 2.3239
+    },
+    "scale": "base",
+    "step": 100000,
+    "switch_accuracy": 0.2229
+  },
+  "routed18@100000": {
+    "arm": "routed18",
+    "bpb_cross": 1.119,
+    "bpb_single": 1.876,
+    "lambada_accuracy": 0.098,
+    "lambada_ppl": 17.07,
+    "note": "Round 2, Recipe 4 (copy-structure mining - diet phase 2 + _is_copy_structured filter on nlp source), 100k/100k continued training from routed8@600000. Real gain vs parent (EM 9.80%/11.60% filtered vs routed8s 6.40%, ppl 17.07 vs 19.13), but nearly IDENTICAL to routed17 (plain diet phase 2, no filter): EM 9.80% both, ppl 17.07 vs 17.14, per-domain BPB within 0.001 of each other. The copy-structure filter (admit only nlp docs where a content word recurs with gap>=15) added no measurable gain beyond diet-phase-2s nlp upweighting alone - suggests the gain in both is coming from the volume/share of nlp tokens, not from selecting LAMBADA-shaped documents specifically. Matches the round-1 finding that routed12/13 landed suspiciously close together too; worth a real ablation (same nlp% without the filter vs with) before concluding the filter mechanism does anything.",
+    "params": 89114364,
+    "per_domain_bpb": {
+      "code": 1.2169,
+      "math": 2.3989,
+      "nlp": 1.4045,
+      "science": 2.3261
+    },
+    "scale": "base",
+    "step": 100000,
+    "switch_accuracy": 0.222
+  },
   "routed2@150000": {
     "arm": "routed2",
     "bpb_cross": 2.8226,
