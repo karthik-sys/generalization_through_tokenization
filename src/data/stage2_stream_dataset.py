@@ -58,50 +58,82 @@ def _shard_id_and_count() -> tuple[int, int]:
     return rank * num_workers + worker_id, world_size * num_workers
 
 
+def _line_offsets(path: Path) -> "np.ndarray":
+    """Byte offset of the start of every line in path, built once and cached to
+    {path}.idx.npy - a single sequential scan (~1min for a 12GB file), reused by every
+    process/rank/worker/run from then on rather than rebuilt per worker. Enables mmap-based
+    random access without ever loading file CONTENT into memory (only this offset array,
+    tens of MB, one per process - shared read-only across workers via the OS page cache same
+    as the mmap itself)."""
+    import numpy as np
+    idx_path = path.with_suffix(path.suffix + ".idx.npy")
+    if idx_path.exists():
+        return np.load(idx_path)
+    offs = []
+    with open(path, "rb") as f:
+        off = 0
+        for line in f:
+            offs.append(off)
+            off += len(line)
+    arr = np.array(offs, dtype=np.uint64)
+    np.save(idx_path, arr)
+    return arr
+
+
 def _cached_doc_stream(domain: str) -> Iterator[str] | None:
     """Returns a forever-looping iterator over a local JSONL cache if one exists for this
     domain, else None (caller falls back to the live HF stream).
 
-    Reads lazily (one line at a time via the file iterator), NOT loaded fully into memory -
-    an earlier version materialized the whole file into a Python list per worker process, which
-    OOM-killed a real run: PackedRoutedStream needs all 4 domains simultaneously, so every
-    worker process loads every domain, and with multiple independently-constructed loaders
-    (routed19's phase1/phase2/val streams each build their own worker pool) that's
-    N_loaders * NUM_WORKERS * (sum of all 4 domains' cache sizes) held in memory at once -
-    confirmed live at ~39GB/domain-set this was approaching hundreds of GB. The OS page cache
-    still makes repeated reads of the same file fast (shared across processes, unlike a
-    process-private Python list), so this isn't a speed regression, just a memory-safety one.
+    mmap + a shuffled line-offset index, NOT sequential reads from a random starting point -
+    an earlier version (skip a random number of lines, then read sequentially to EOF) avoided
+    the memory blowup of a prior full-materialization bug, but introduced real correlation:
+    every worker reads a long CONTIGUOUS run of the source file per pass, and if the cache has
+    any structural ordering (source/length/alphabetical - real risk, never audited), consecutive
+    batches end up correlated rather than i.i.d., which is exactly what SGD assumes isn't
+    happening. mmap gives memory-safe random access (shared read-only OS pages across every
+    worker process, not a private copy) to a genuinely shuffled permutation of line offsets,
+    with each (rank, worker) pair getting an EXACT, non-overlapping partition - both problems
+    fixed by the same change, not two separate patches."""
+    import mmap as mmap_module
 
-    Diversity across workers/ranks: each pass skips a bounded random number of lines before
-    reading (reseeded every pass, seeded by a rank+worker-unique id) rather than a full
-    shuffle - approximate, not a perfect shuffle, but avoids ever materializing the file."""
+    import numpy as np
+
     path = _cache_path(domain)
     if not path.exists():
         return None
+    offsets = _line_offsets(path)
+    if len(offsets) == 0:
+        return None
 
-    shard_id, _ = _shard_id_and_count()
+    shard_id, num_shards = _shard_id_and_count()
 
     def _gen():
-        rng = random.Random(shard_id)
-        while True:
-            with open(path) as f:
-                skip = rng.randint(0, 20000)  # bounded - just diversity, not a real shuffle
-                for _ in range(skip):
-                    if next(f, None) is None:
-                        break
-                yielded_any = False
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        text = json.loads(line)["text"]
-                    except json.JSONDecodeError:
-                        continue
-                    yielded_any = True
-                    yield text
-                if not yielded_any and skip == 0:
-                    raise RuntimeError(f"cache file {path} appears empty")
+        with open(path, "rb") as f:
+            mm = mmap_module.mmap(f.fileno(), 0, access=mmap_module.ACCESS_READ)
+            pass_num = 0
+            try:
+                while True:
+                    # Same base seed on every rank/worker (a real requirement, not a bug -
+                    # the permutation must be identical everywhere so partitioning by
+                    # [shard_id::num_shards] below gives an EXACT, non-overlapping split of
+                    # the same shuffled order; only the SLICE differs per shard, not the
+                    # underlying permutation). Reseeded per pass_num so multi-epoch reuse
+                    # doesn't replay the identical order every time.
+                    perm = np.random.RandomState(pass_num).permutation(len(offsets))
+                    my_lines = perm[shard_id::num_shards]
+                    for i in my_lines:
+                        start = int(offsets[i])
+                        end = int(offsets[i + 1]) if i + 1 < len(offsets) else len(mm)
+                        line = mm[start:end].decode("utf-8", errors="ignore").strip()
+                        if not line:
+                            continue
+                        try:
+                            yield json.loads(line)["text"]
+                        except json.JSONDecodeError:
+                            continue
+                    pass_num += 1
+            finally:
+                mm.close()
 
     return _gen()
 

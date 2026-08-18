@@ -517,6 +517,22 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     # launch by checking this against the ROUTED19_TARGET_MICROSTEPS derivation, not by the
     # code itself - verify again if any other arm ever needs its own batch/accum pair).
     grad_accum = ROUTED19_GRAD_ACCUM_STEPS if arm == "routed19" else GRAD_ACCUM_STEPS
+    if arm == "routed19":
+        # Explicit, loud assert for exactly the class of bug this session already found twice
+        # (grad_accum silently using the wrong constant; world_size silently absent from the
+        # batch math) - designed_effective_batch is the SAME 64 every arm in this codebase
+        # uses; per-rank micro batch is what _ld's world_size division actually produces.
+        designed_effective_batch = 64
+        per_rank_micro = ROUTED19_BATCH_SIZE // max(world_size, 1)
+        actual_effective_batch = per_rank_micro * grad_accum * world_size
+        assert actual_effective_batch == designed_effective_batch, (
+            f"effective batch mismatch: {per_rank_micro} (per-rank micro) * {grad_accum} "
+            f"(grad_accum) * {world_size} (world_size) = {actual_effective_batch}, expected "
+            f"{designed_effective_batch}. ROUTED19_BATCH_SIZE must be divisible by world_size."
+        )
+        if is_main:
+            print(f"effective batch check OK: {per_rank_micro} x {grad_accum} x {world_size} "
+                  f"= {actual_effective_batch}", flush=True)
     if is_main:
         print(f"device: {torch.cuda.get_device_name(local_rank)}  world_size: {world_size}  "
               f"arm: {arm}  steps: {total_steps}", flush=True)
@@ -723,7 +739,10 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     from src.model.stage2_config import EVAL_EVERY, VAL_BATCHES, VAL_SEED
 
     val_iter = None
-    if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4", "routed5",
+    # is_main only: _held_out_ce() is already rank-0-guarded below, so building this loader
+    # (its own NUM_WORKERS DataLoader worker pool) on every other rank was pure waste - workers
+    # that spin up, hold memory, and are never actually read from.
+    if is_main and arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4", "routed5",
                "routed6", "routed7", "routed8", "routed9", "routed10", "routed19") + BET_ARMS + DIET_ARMS:
         rs3 = arm == "routed3"
         books_upweighted = arm in ("routed9", "routed10")
@@ -900,9 +919,16 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             # raw_model, not model - model.state_dict() on a DDP-wrapped module prefixes every
             # key with "module.", which would silently break every eval function (stage2_modal.
             # py's evaluate()/evaluate_lambada()) that loads a plain (non-DDP) model class.
+            # Write to a .tmp path then os.replace (atomic on POSIX) rather than torch.save
+            # directly to the final path - this pod has genuinely restarted mid-run multiple
+            # times tonight (RunPod migrations, watchdog restarts); a crash mid-write to the
+            # real filename would leave a truncated .pt that the NEXT launch's resume logic
+            # would try to load, corrupting the run instead of just losing the latest interval.
             path = CKPT_DIR / f"{ckpt_prefix}_step{step}.pt"
+            tmp_path = path.with_suffix(".pt.tmp")
             torch.save({"model": raw_model.state_dict(), "opt": opt.state_dict(), "step": step,
-                        "domain_vocab_sizes": bundle.domain_vocab_sizes, "history": history}, path)
+                        "domain_vocab_sizes": bundle.domain_vocab_sizes, "history": history}, tmp_path)
+            os.replace(tmp_path, path)
             print(f"checkpoint saved: {path}", flush=True)
             # prune older checkpoints for this arm - keep only the newest, disk isn't infinite
             for old in _latest_checkpoint()[1:]:
