@@ -315,8 +315,14 @@ HYBRID_NATURAL_DATA_FRACTION = 0.6
 # (~2.46B tokens) - a verified 16x shortfall (2.46B x 16 = 39.3B). ROUTED19_TARGET_MICROSTEPS
 # is DATA_EQUIVALENT_STEPS's ORIGINAL 150,000-optimizer-update baseline (~9.83B tokens, the
 # doc's core GPT-2-parity target, not its extra 4x stretch tier) expressed correctly in the
-# code's actual micro-step units: 150,000 * GRAD_ACCUM_STEPS(16) = 2,400,000.
-ROUTED19_TARGET_MICROSTEPS = 2_400_000
+# code's actual micro-step units - using ROUTED19_BATCH_SIZE/ROUTED19_GRAD_ACCUM_STEPS below
+# (32/2), NOT the global BATCH_SIZE/GRAD_ACCUM_STEPS (4/16) other arms use: target_tokens
+# (150,000 * 65,536 = 9.83B) / (ROUTED19_BATCH_SIZE(32) * max_seq_len(1024)) = 300,000.
+# Getting this denominator wrong (i.e. using the global BATCH_SIZE instead) would silently
+# produce an 8x-too-large step count - caught by hand-checking real_opt_updates == 150,000
+# before ever launching a real run, not by the code itself, so verify this arithmetic again
+# if ROUTED19_BATCH_SIZE ever changes.
+ROUTED19_TARGET_MICROSTEPS = 300_000
 
 # routed19 only: curriculum split (user-specified 60/40) - the first fraction of training
 # uses PackedRoutedStream with min_domains=max_domains=1 (see ROUTED19_PHASE1_SNIPPET_WORDS
