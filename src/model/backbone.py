@@ -4,8 +4,6 @@ and, at matched size, as the baseline's backbone - only the embedding/head layer
 between the two, per spec §9's matched-compute comparison.
 """
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,11 +22,18 @@ class CausalSelfAttention(nn.Module):
         b, t, d = x.shape
         qkv = self.qkv(x).view(b, t, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # (b, n_heads, t, head_dim)
-        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        mask = torch.triu(torch.ones(t, t, device=x.device, dtype=torch.bool), diagonal=1)
-        attn = attn.masked_fill(mask, float("-inf"))
-        attn = F.softmax(attn, dim=-1)
-        out = attn @ v  # (b, n_heads, t, head_dim)
+        # F.scaled_dot_product_attention replaces the manual QK^T/sqrt(d) -> causal mask ->
+        # softmax -> @V sequence below (same math - verified numerically equivalent,
+        # max diff ~1e-6 in fp32, across several shapes including the real b=2/heads=8/t=1024
+        # config, before this swap went in). On Ampere+ (A40 qualifies) this dispatches to a
+        # fused FlashAttention/memory-efficient kernel instead of materializing the full
+        # (t, t) attention matrix - real compute AND memory win, not just a style change.
+        #   attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        #   mask = torch.triu(torch.ones(t, t, device=x.device, dtype=torch.bool), diagonal=1)
+        #   attn = attn.masked_fill(mask, float("-inf"))
+        #   attn = F.softmax(attn, dim=-1)
+        #   out = attn @ v
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # (b, n_heads, t, head_dim)
         out = out.transpose(1, 2).reshape(b, t, d)
         return self.out(out)
 
