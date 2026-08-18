@@ -165,6 +165,12 @@ ARM_LABELS = {
                "additively into the vocab logits via a learned gate - attacks the "
                "calibration-vs-argmax gap (NLL spreads mass over synonyms; EM only rewards top-1) "
                "directly, in-batch hard negatives instead of a periodic mining loop.",
+    "routed14": "Scaled-up routed8: LARGE scale (190.5M) + the copy-gate mechanism (Bet 1's "
+               "architecture, reused as-is - it's already generic over model size), warm-started "
+               "from routed7@150k (already OWT-sourced + large-scale, so this saves the 150k "
+               "steps routed8 needed to reach the same starting point) rather than routed8 itself "
+               "(89M - wrong param count to warm-start a 190M model from). Tests whether scale "
+               "and the data/volume lever compound, now that both individually helped.",
 }
 
 # routed11/12/13 ("bet" arms, all warm-started from routed8@575k, no reinit - same OWT
@@ -181,6 +187,7 @@ NEW_MODULE_MATCH = {
     "routed11": ("copy_q.", "copy_k.", "copy_gate."),
     "routed12": ("lora_a.", "lora_b."),
     "routed13": ("precision_proj.", "precision_gate."),
+    "routed14": ("copy_q.", "copy_k.", "copy_gate."),  # same mechanism as routed11, at large scale
 }
 
 # routed7 (extended) and routed8 target ~600,000 steps rather than the usual 150,000. At
@@ -208,6 +215,7 @@ DATA_EQUIVALENT_STEPS = 600000
 WARM_START_PARENT = {
     "routed9": "routed", "routed10": "large_routed7",
     "routed11": "routed8", "routed12": "routed8", "routed13": "routed8",
+    "routed14": "large_routed7",  # NOT routed8 - wrong param count (89M) to warm-start a 190M model from
 }
 COOLDOWN_STEPS = 50000  # ~1/3 of a full run - cheap, and the backbone is already trained
 COOLDOWN_BACKBONE_LR_SCALE = 0.1  # warm-started params (everything but nlp) train 10x slower

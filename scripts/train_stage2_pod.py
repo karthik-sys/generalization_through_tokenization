@@ -46,7 +46,8 @@ from src.model.stage2_config import (
     ROUTED3_SNIPPET_WORDS, SWITCH_WEIGHT, WARM_START_PARENT, WARMUP_STEPS,
 )
 
-BET_ARMS = ("routed11", "routed12", "routed13")  # copy-gate, deep-experts, precision-head
+BET_ARMS = ("routed11", "routed12", "routed13", "routed14")  # copy-gate, deep-experts, precision-head, scaled-up copy-gate
+LARGE_BET_ARMS = ("routed14",)  # subset of BET_ARMS that forces scale="large" (see _build_model)
 
 TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2")
 # arm in ("routed7", "routed8"): nlp tokenizer retrained on OpenWebText (see
@@ -245,7 +246,9 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
             return MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LARGE_MODEL_CFG).to(device)
         if arm == "routed10":  # routed7's pair - same architecture, warm-started + books + upweighted (see _warm_start_from_parent)
             return MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LARGE_MODEL_CFG).to(device)
-        raise ValueError(f"scale=large supports mot/baseline/routed/routed3/routed7/routed10, not {arm}")
+        if arm == "routed14":  # routed11's copy-gate mechanism at large scale, warm-started from routed7
+            return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LARGE_MODEL_CFG).to(device)
+        raise ValueError(f"scale=large supports mot/baseline/routed/routed3/routed7/routed10/routed14, not {arm}")
     if arm == "mot":
         return MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     if arm in ("routed", "routed8", "routed9"):
@@ -290,7 +293,7 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
 def calibrate(arm: str, steps: int, scale: str = "base") -> float:
     device = "cuda"
     print(f"CUDA available: {torch.cuda.is_available()}  device: {torch.cuda.get_device_name(0)}", flush=True)
-    if arm in ("routed7", "routed10"):
+    if arm in ("routed7", "routed10") + LARGE_BET_ARMS:
         scale = "large"  # always large-scale, regardless of what --scale was passed
     if arm in ("routed7", "routed8") + BET_ARMS:
         _apply_openwebtext_nlp_source()  # routed11/12/13 reuse routed8's exact nlp source
@@ -389,7 +392,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     total_steps = max_steps or MAX_STEPS
     print(f"device: {torch.cuda.get_device_name(0)}  arm: {arm}  steps: {total_steps}", flush=True)
     print(f"ARM: {arm}  =  {ARM_LABELS.get(arm, arm)}", flush=True)
-    if arm in ("routed7", "routed10"):
+    if arm in ("routed7", "routed10") + LARGE_BET_ARMS:
         scale = "large"  # always large-scale, regardless of what --scale was passed
     if arm in ("routed7", "routed8") + BET_ARMS:
         _apply_openwebtext_nlp_source()  # routed11/12/13 reuse routed8's exact nlp source
@@ -671,7 +674,8 @@ if __name__ == "__main__":
     parser.add_argument("--arm", required=True,
                          choices=["mot", "baseline", "sota", "routed", "pooled", "hybrid", "pooled2",
                                   "routed2", "routed3", "routed4", "routed5", "routed6", "routed7",
-                                  "routed8", "routed9", "routed10", "routed11", "routed12", "routed13"])
+                                  "routed8", "routed9", "routed10", "routed11", "routed12", "routed13",
+                                  "routed14"])
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--scale", choices=["base", "large"], default="base",
                          help="'large' (mot/baseline only) uses LARGE_MODEL_CFG for the scale test")
