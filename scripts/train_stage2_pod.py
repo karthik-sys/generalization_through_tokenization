@@ -339,6 +339,17 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
             force_domain_filter=(COPY_MINE_MIN_WORD_LEN, COPY_MINE_MIN_GAP) if arm == "routed18" else None,
         ), batch_size=BATCH_SIZE))
+    elif arm == "routed16":
+        # Backbone is frozen (FROZEN_BACKBONE_ARMS) - only copy_q/copy_k/copy_gate get
+        # gradient, and those only fire on nlp-domain tokens. A batch with zero nlp content
+        # would have a loss fully disconnected from every trainable tensor, crashing
+        # backward() ("does not require grad and does not have a grad_fn") - confirmed live,
+        # not hypothetical. force_domain guarantees nlp's PRESENCE every batch (default
+        # snippet_words, no upweighting - unlike routed17/18, routed16 isn't a mixture-share
+        # bet, it just needs the copy-gate mechanism to always have something to learn from).
+        loader = iter(DataLoader(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"], force_domain="nlp",
+        ), batch_size=BATCH_SIZE))
     elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
@@ -542,6 +553,17 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
             force_domain_filter=(COPY_MINE_MIN_WORD_LEN, COPY_MINE_MIN_GAP) if arm == "routed18" else None,
+        ), batch_size=BATCH_SIZE))
+    elif arm == "routed16":
+        # Backbone is frozen (FROZEN_BACKBONE_ARMS) - only copy_q/copy_k/copy_gate get
+        # gradient, and those only fire on nlp-domain tokens. A batch with zero nlp content
+        # would have a loss fully disconnected from every trainable tensor, crashing
+        # backward() ("does not require grad and does not have a grad_fn") - confirmed live,
+        # not hypothetical. force_domain guarantees nlp's PRESENCE every batch (default
+        # snippet_words, no upweighting - unlike routed17/18, routed16 isn't a mixture-share
+        # bet, it just needs the copy-gate mechanism to always have something to learn from).
+        loader = iter(DataLoader(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"], force_domain="nlp",
         ), batch_size=BATCH_SIZE))
     elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
