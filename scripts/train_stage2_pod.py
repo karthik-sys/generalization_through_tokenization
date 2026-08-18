@@ -111,7 +111,19 @@ def _loader(dataset, batch_size: int = None, world_size: int = 1):
         pin_memory=True,
         prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
         persistent_workers=NUM_WORKERS > 0,
+        worker_init_fn=_worker_init if NUM_WORKERS > 0 else None,
     )
+
+
+def _worker_init(_worker_id: int) -> None:
+    # Each DataLoader worker is its own process; by default torch/numpy's BLAS backends may
+    # spawn multiple threads PER WORKER for internal ops. With NUM_WORKERS(4) workers per GPU
+    # process and up to world_size GPU processes on one host, that's real oversubscription risk
+    # on shared CPU cores (this pipeline's workers do I/O + JSON/string parsing, not linear
+    # algebra, so they gain nothing from multi-threading and only cost contention). Restricting
+    # each worker to 1 thread is standard practice for CPU-bound-by-many-processes DataLoader
+    # workloads like this one.
+    torch.set_num_threads(1)
 
 
 TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2")
@@ -367,6 +379,13 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
     if is_main:
         print(f"CUDA available: {torch.cuda.is_available()}  device: {torch.cuda.get_device_name(local_rank)}"
               f"  world_size: {world_size}", flush=True)
+    # Mirror train()'s world_size-aware batch/accum split (see the detailed comment there) so
+    # calibrate's memory profile matches what the real run will actually use - calibrate()
+    # doesn't accumulate gradients at all (opt.step() every micro-step), so this only matters
+    # for getting a representative peak-memory reading, not for timing per real optimizer update.
+    if arm == "routed19":
+        calib_grad_accum = 1 if world_size > 1 else ROUTED19_GRAD_ACCUM_STEPS
+        routed19_batch_size = 64 // calib_grad_accum
     if arm in ("routed7", "routed10") + LARGE_BET_ARMS:
         scale = "large"  # always large-scale, regardless of what --scale was passed
     if arm in OWT_TOKENIZER_ARMS:
@@ -431,10 +450,10 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
         phase1_loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             min_domains=1, max_domains=1, snippet_words=ROUTED19_PHASE1_SNIPPET_WORDS,
-        ), batch_size=ROUTED19_BATCH_SIZE))
+        ), batch_size=routed19_batch_size))
         phase2_loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
-        ), batch_size=ROUTED19_BATCH_SIZE))
+        ), batch_size=routed19_batch_size))
         routed19_phase1_steps = round(steps * ROUTED19_PHASE1_FRACTION)
     elif arm in ("routed4", "routed6"):  # both use 2x context
         loader = iter(_ld(PackedRoutedStream(bundle, domain_index, LONGCTX_MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
@@ -460,12 +479,12 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             # routed4 (combined: decoupled head + learned weight) takes no switch_weight
             # kwarg - it's an internal learned parameter, same call shape as routed2/routed3.
             tok, dom, ctrl, typ, tgt = next(loader)
-            tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
+            tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
         elif arm in ("routed", "pooled", "pooled2", "routed5", "routed6", "routed7", "routed8", "routed9", "routed10") + BET_ARMS + DIET_ARMS:
             tok, dom, ctrl, typ, tgt = next(loader)
-            tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
+            tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
             with torch.autocast("cuda"):
                 if arm in ("pooled", "pooled2"):
                     loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ,
@@ -475,7 +494,7 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
         elif arm == "routed19":
             src = phase1_loader if step <= routed19_phase1_steps else phase2_loader
             tok, dom, ctrl, typ, tgt = next(src)
-            tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
+            tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
         else:
@@ -509,30 +528,37 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     is_main = rank == 0
     _ld = partial(_loader, world_size=world_size)
     total_steps = max_steps or MAX_STEPS
-    # routed19 uses its OWN grad-accum count (ROUTED19_GRAD_ACCUM_STEPS=2, paired with
-    # ROUTED19_BATCH_SIZE=32) to hold the same effective batch (64) as every other arm's
-    # BATCH_SIZE(4)*GRAD_ACCUM_STEPS(16) - using the global GRAD_ACCUM_STEPS here instead would
-    # silently give routed19 an effective batch of 32*16=512, not 64, and only total_steps/16
-    # real optimizer updates instead of the design's intended total_steps/2 (caught before
-    # launch by checking this against the ROUTED19_TARGET_MICROSTEPS derivation, not by the
-    # code itself - verify again if any other arm ever needs its own batch/accum pair).
-    grad_accum = ROUTED19_GRAD_ACCUM_STEPS if arm == "routed19" else GRAD_ACCUM_STEPS
+    # routed19's effective batch is a fixed invariant (64, matching every other arm's
+    # BATCH_SIZE(4)*GRAD_ACCUM_STEPS(16)) - HOW it's reached differs by world_size, and the
+    # split matters for real throughput, not just correctness:
+    #  - world_size==1: grad_accum=2, micro-batch=32 - the validated single-GPU setting
+    #    (calibrated live: 22GB/46GB peak memory, 0.442 sec/step). Kept exactly as measured.
+    #  - world_size>1: grad_accum=1, micro-batch=64/world_size - DROPS accumulation entirely
+    #    rather than keep dividing the single-GPU batch by world_size (which would have given
+    #    a needlessly tiny batch, e.g. 32/4=8 at 4 GPUs, while still paying for 2 accumulation
+    #    micro-steps and no_sync() bookkeeping per real update for no reason - once multiple
+    #    GPUs are already splitting the effective batch, the accumulation dimension is no
+    #    longer needed to keep any single device's batch small. At 4 GPUs this gives
+    #    micro-batch=16, not 8 - genuinely bigger per-step work, simpler code (every step is a
+    #    sync step, no no_sync() branch), same real optimizer-update count either way.
     if arm == "routed19":
-        # Explicit, loud assert for exactly the class of bug this session already found twice
-        # (grad_accum silently using the wrong constant; world_size silently absent from the
-        # batch math) - designed_effective_batch is the SAME 64 every arm in this codebase
-        # uses; per-rank micro batch is what _ld's world_size division actually produces.
         designed_effective_batch = 64
-        per_rank_micro = ROUTED19_BATCH_SIZE // max(world_size, 1)
+        grad_accum = 1 if world_size > 1 else ROUTED19_GRAD_ACCUM_STEPS
+        routed19_batch_size = designed_effective_batch // grad_accum  # world_size division
+        # happens inside _ld itself (see _loader) - passing this un-divided value through is
+        # deliberate, not a bug: (64//grad_accum) // world_size == 64/(grad_accum*world_size).
+        per_rank_micro = routed19_batch_size // max(world_size, 1)
         actual_effective_batch = per_rank_micro * grad_accum * world_size
         assert actual_effective_batch == designed_effective_batch, (
             f"effective batch mismatch: {per_rank_micro} (per-rank micro) * {grad_accum} "
             f"(grad_accum) * {world_size} (world_size) = {actual_effective_batch}, expected "
-            f"{designed_effective_batch}. ROUTED19_BATCH_SIZE must be divisible by world_size."
+            f"{designed_effective_batch}."
         )
         if is_main:
             print(f"effective batch check OK: {per_rank_micro} x {grad_accum} x {world_size} "
                   f"= {actual_effective_batch}", flush=True)
+    else:
+        grad_accum = GRAD_ACCUM_STEPS
     if is_main:
         print(f"device: {torch.cuda.get_device_name(local_rank)}  world_size: {world_size}  "
               f"arm: {arm}  steps: {total_steps}", flush=True)
@@ -657,7 +683,13 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     # either crash or silently do the wrong thing.
     raw_model = model
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank])
+        model = DDP(
+            model, device_ids=[local_rank],
+            gradient_as_bucket_view=True,  # fewer gradient-bucket memory copies
+            broadcast_buffers=False,  # no BatchNorm-style running-stat buffers on a transformer
+            static_graph=True,  # same forward path every step (just different data) - lets
+            # DDP skip re-deriving its reducer/bucket structure each iteration
+        )
 
     def lr_at(step: int) -> float:
         if step < WARMUP_STEPS:
@@ -707,10 +739,10 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         phase1_loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             min_domains=1, max_domains=1, snippet_words=ROUTED19_PHASE1_SNIPPET_WORDS,
-        ), batch_size=ROUTED19_BATCH_SIZE))
+        ), batch_size=routed19_batch_size))
         phase2_loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
-        ), batch_size=ROUTED19_BATCH_SIZE))
+        ), batch_size=routed19_batch_size))
         routed19_phase1_steps = round(total_steps * ROUTED19_PHASE1_FRACTION)
         print(f"routed19 curriculum: phase 1 (single-domain) steps 1-{routed19_phase1_steps}, "
               f"phase 2 (switching) steps {routed19_phase1_steps + 1}-{total_steps}", flush=True)
@@ -758,7 +790,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                                          DIET_PHASE2_NLP_SNIPPET_WORDS if diet_upweighted else None),
             force_domain_filter=(COPY_MINE_MIN_WORD_LEN, COPY_MINE_MIN_GAP) if arm == "routed18" else None,
         )
-        val_iter = iter(_ld(val_stream, batch_size=ROUTED19_BATCH_SIZE if arm == "routed19" else BATCH_SIZE))
+        val_iter = iter(_ld(val_stream, batch_size=routed19_batch_size if arm == "routed19" else BATCH_SIZE))
 
     def _held_out_ce():
         model.eval()
@@ -807,7 +839,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                 if step % LOG_EVERY == 0:
                     print(f"step {step}/{total_steps}  SKIPPED (no nlp tokens in window)", flush=True)
                 continue
-            tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
+            tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
         elif arm == "routed19":
@@ -816,7 +848,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             # counter that would reset to 0 and misjudge the phase on every restart.
             src = phase1_loader if step <= routed19_phase1_steps else phase2_loader
             tok, dom, ctrl, typ, tgt = next(src)
-            tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
+            tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
         elif arm == "hybrid":
@@ -828,7 +860,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             # routed4 (combined): no switch_weight kwarg, weight is an internal learned
             # parameter. Same call shape as routed2/routed3 otherwise.
             tok, dom, ctrl, typ, tgt = next(loader)
-            tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
+            tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
             with torch.autocast("cuda"):
                 loss, parts = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
             controller_loss = parts["_content"]
@@ -837,12 +869,12 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             # shape identical to plain routed. Not in the controller list, so no
             # controller_loss needed here.
             tok, dom, ctrl, typ, tgt = next(loader)
-            tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
+            tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
         elif arm in ("pooled", "pooled2"):
             tok, dom, ctrl, typ, tgt = next(loader)
-            tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
+            tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
             adv_lambda = min(1.0, step / max(1, ADV_LAMBDA_RAMP_STEPS))
             with torch.autocast("cuda"):
                 loss, parts = model(tok, dom, ctrl, targets=tgt, type_ids=typ,
@@ -855,6 +887,21 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             with torch.autocast("cuda"):
                 logits = model(inp)
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
+
+        if world_size > 1:
+            # Real, untested-until-now hazard for this architecture specifically: domain
+            # composition per synthetic doc is randomized, so a given 1024-token micro-batch
+            # can easily contain zero tokens for one or more domains (math/science especially).
+            # That domain's head/embedding gets literally no gradient path that step - DDP's
+            # default (find_unused_parameters=False, which static_graph=True above requires
+            # anyway) expects every registered parameter to participate in every backward call,
+            # so this would hang or crash mid-run, not fail loudly at launch. Forcing a
+            # (numerically inert - the 0.0 multiplier means it changes nothing about what's
+            # being optimized) dependency on every parameter is the standard, cheap fix -
+            # restructuring PackedRoutedStream to guarantee per-domain quotas in every micro-
+            # batch would also work but is a real data-pipeline change, not worth the risk this
+            # close to launch when this is a one-line, correctness-only addition.
+            loss = loss + 0.0 * sum(p.sum() for p in raw_model.parameters())
 
         loss_val = loss.item()
         controller_loss_val = float(controller_loss) if arm in ("pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4") else loss_val
