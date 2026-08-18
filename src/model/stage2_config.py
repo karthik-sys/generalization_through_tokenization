@@ -191,6 +191,16 @@ ARM_LABELS = {
                "the same document), via a stream-level filter, not a new loss/module. Attacks the "
                "same 82.8%-copy-failure error class as Bet 1, but through data instead of "
                "architecture - lower risk given what happened to routed11/14.",
+    "routed19": "Round-3: from-scratch, curriculum-ordered, corrected GPT-2-parity token budget. "
+               "Fixes a verified 16x token-budget shortfall (routed8 delivered ~2.46B tokens against "
+               "a ~9.83B/39.3B doc-intended target - a units mismatch between DATA_EQUIVALENT_STEPS' "
+               "own comment and the training loop's actual step-counting). Phase 1 "
+               "(ROUTED19_PHASE1_FRACTION of steps): single-domain-only data (PackedRoutedStream, "
+               "min/max_domains=1, long snippets) - genuine coherent runs, no mid-sequence switching "
+               "at all. Phase 2 (remainder): the standard splice-from-step-0 recipe every prior arm "
+               "used for its entire run. Same architecture as routed8 (plain MoTRoutedModel, OWT nlp "
+               "source, base scale) - the only variables are curriculum ordering and a corrected "
+               "~9.83B-token budget, isolated from any architecture change.",
 }
 
 # --- Round 2 (routed15-18): informed by routed11-14's post-mortem ---------------------------
@@ -296,6 +306,48 @@ HYBRID_NATURAL_DATA_FRACTION = 0.6
 # switch-loss fix as routed2, so any difference between them isolates "does pushing further
 # in the direction that's already winning (routed's cross-domain BPB/LAMBADA) help more than
 # just fixing the loss".
+# routed19 only: real fix for the DATA_EQUIVALENT_STEPS token-budget bug found this session -
+# that constant's own comment defines "step" as one OPTIMIZER update (BATCH_SIZE*GRAD_ACCUM_
+# STEPS*max_seq_len = 65,536 tokens), but train_stage2_pod.py's loop counts "step" as one
+# MICRO-batch (BATCH_SIZE*max_seq_len = 4,096 tokens, GRAD_ACCUM_STEPS=16 micro-steps per real
+# update). routed8 was launched with --steps 600000 under the doc's intended meaning (600,000
+# real optimizer updates -> ~39.3B tokens) but the code delivered 600,000 micro-batches only
+# (~2.46B tokens) - a verified 16x shortfall (2.46B x 16 = 39.3B). ROUTED19_TARGET_MICROSTEPS
+# is DATA_EQUIVALENT_STEPS's ORIGINAL 150,000-optimizer-update baseline (~9.83B tokens, the
+# doc's core GPT-2-parity target, not its extra 4x stretch tier) expressed correctly in the
+# code's actual micro-step units: 150,000 * GRAD_ACCUM_STEPS(16) = 2,400,000.
+ROUTED19_TARGET_MICROSTEPS = 2_400_000
+
+# routed19 only: curriculum split (user-specified 60/40) - the first fraction of training
+# uses PackedRoutedStream with min_domains=max_domains=1 (see ROUTED19_PHASE1_SNIPPET_WORDS
+# below), giving the model genuine long single-domain runs before it ever has to handle
+# mid-sequence switching, instead of splicing 2-4 domains together from step 1 the way every
+# prior arm (routed8 included) has. The remainder uses the standard default PackedRoutedStream
+# args - the exact same recipe routed8 always used, now applied as phase 2 rather than the
+# entire run.
+ROUTED19_PHASE1_FRACTION = 0.6
+
+# routed19 phase 1 only: single-domain snippet length, vs the default SNIPPET_WORDS=250 used
+# everywhere else. PackedRoutedStream packs a continuous token buffer across doc boundaries
+# regardless of domain, so a long snippet doesn't GUARANTEE zero domain-mixing within a single
+# 1024-token window - it just makes cross-domain window boundaries much rarer (roughly
+# proportional to snippet_words/250, i.e. ~12x rarer at this setting), capped by whichever is
+# shorter: this setting, or a given real source document's own natural length. An honest,
+# real reduction in switch density, not a hard single-domain-per-window guarantee.
+ROUTED19_PHASE1_SNIPPET_WORDS = 3000
+
+# routed19 only: BATCH_SIZE=4 (global) was deliberately kept small to bound sota's 100k-vocab
+# logits tensor (batch*seq*vocab*4 bytes - see the comment above BATCH_SIZE). routed19 is a
+# domain-routed arm with per-domain vocabs in the ~30-40k range (much smaller than sota's
+# shared 100k), so it doesn't need that same headroom - scoped here rather than raising the
+# global BATCH_SIZE, so sota/baseline's memory margin is untouched. GRAD_ACCUM_STEPS lowered
+# proportionally to hold the same effective batch (64) and LR/schedule math routed8 used -
+# this only changes wall-clock/cost, never what's mathematically being trained. Verify actual
+# peak GPU memory via a real calibrate() run before trusting this blindly (done - see launch
+# notes); reduce back toward BATCH_SIZE if it doesn't fit.
+ROUTED19_BATCH_SIZE = 32
+ROUTED19_GRAD_ACCUM_STEPS = 2  # 32 * 2 = 64, same effective batch as everywhere else
+
 ROUTED3_MIN_DOMAINS = 4
 ROUTED3_MAX_DOMAINS = 4
 ROUTED3_SNIPPET_WORDS = 100

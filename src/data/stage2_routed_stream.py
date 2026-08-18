@@ -21,7 +21,8 @@ from typing import Iterator
 
 import torch
 from datasets import load_dataset
-from torch.utils.data import IterableDataset
+from datasets.distributed import split_dataset_by_node
+from torch.utils.data import IterableDataset, get_worker_info
 
 from src.data.stage2_stream_dataset import TEXT_EXTRACTORS
 from src.model.stage2_config import DOMAIN_TAG, STREAM_SOURCES
@@ -39,6 +40,10 @@ def _raw_body_stream(domain: str) -> Iterator[str]:
     TEXT_EXTRACTORS['code'] does its own language+license filtering (see stage2_stream_
     dataset.py), the generic path below works for every domain, code included.
     """
+    # Resolved lazily (inside this generator's body) so it reflects the worker this generator
+    # actually runs in - see the matching comment in stage2_stream_dataset.py's
+    # _raw_doc_stream for why unsharded multi-worker replay would just duplicate documents.
+    worker_info = get_worker_info()
     while True:
         cfg = STREAM_SOURCES[domain]
         stream = load_dataset(
@@ -46,6 +51,8 @@ def _raw_body_stream(domain: str) -> Iterator[str]:
             data_files=cfg.get("data_files"), split="train", streaming=True,
             trust_remote_code=True,
         )
+        if worker_info is not None and worker_info.num_workers > 1:
+            stream = split_dataset_by_node(stream, rank=worker_info.id, world_size=worker_info.num_workers)
         extractor = TEXT_EXTRACTORS[domain]
         for row in stream:
             text = extractor(row)

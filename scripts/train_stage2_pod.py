@@ -44,7 +44,9 @@ from src.model.stage2_config import (
     COPY_MINE_MIN_GAP, COPY_MINE_MIN_WORD_LEN, COPYGATE_V2_BIAS_INIT, DIET_PHASE2_NLP_SNIPPET_WORDS,
     FOCAL_GAMMA, FROZEN_BACKBONE_ARMS, GRAD_ACCUM_STEPS, HYBRID_NATURAL_DATA_FRACTION, LOG_EVERY,
     LONGCTX_MODEL_CFG, LR, MAX_STEPS, MODEL_CFG, NEW_MODULE_MATCH, ROUTED3_MAX_DOMAINS,
-    ROUTED3_MIN_DOMAINS, ROUTED3_SNIPPET_WORDS, SWITCH_WEIGHT, WARM_START_PARENT, WARMUP_STEPS,
+    ROUTED3_MIN_DOMAINS, ROUTED3_SNIPPET_WORDS, ROUTED19_BATCH_SIZE, ROUTED19_GRAD_ACCUM_STEPS,
+    ROUTED19_PHASE1_FRACTION, ROUTED19_PHASE1_SNIPPET_WORDS, SWITCH_WEIGHT, WARM_START_PARENT,
+    WARMUP_STEPS,
 )
 
 BET_ARMS = ("routed11", "routed12", "routed13", "routed14", "routed15", "routed16")
@@ -53,8 +55,30 @@ BET_ARMS = ("routed11", "routed12", "routed13", "routed14", "routed15", "routed1
 LARGE_BET_ARMS = ("routed14",)  # subset of BET_ARMS that forces scale="large" (see _build_model)
 DIET_ARMS = ("routed17", "routed18")  # round-2 data-lever arms: force_domain="nlp" upweighting,
 # same mechanism as routed9/10 but no reinit (nlp-vs-rest differential LR via WARM_START_PARENT)
-OWT_TOKENIZER_ARMS = ("routed7", "routed8") + BET_ARMS + DIET_ARMS  # everything sourcing nlp from
+OWT_TOKENIZER_ARMS = ("routed7", "routed8", "routed19") + BET_ARMS + DIET_ARMS  # everything sourcing nlp from
 # OpenWebText with routed8's own OWT-fit tokenizer (routed9/10 use PG-19 books instead)
+
+# Every DataLoader in this file used to default to num_workers=0 - synchronous, single-
+# process data loading, meaning the GPU sat idle every micro-step while Python fetched +
+# tokenized the next document from a network-streamed HF dataset, with zero overlap between
+# I/O and compute. NUM_WORKERS>0 background-prefetches while the GPU computes the current
+# batch; PIN_MEMORY speeds up the host->device copy. Safe to apply everywhere (not just
+# routed19) since the *_raw_doc_stream/_raw_body_stream sharding fix (get_worker_info-based,
+# see stage2_stream_dataset.py/stage2_routed_stream.py) makes every existing single-worker
+# call site (num_workers=0 elsewhere) behave identically to before - this only changes
+# throughput, never what data is seen for a given num_workers value.
+NUM_WORKERS = 4
+PREFETCH_FACTOR = 4
+
+
+def _loader(dataset, batch_size: int = None):
+    return DataLoader(
+        dataset, batch_size=batch_size or BATCH_SIZE, num_workers=NUM_WORKERS,
+        pin_memory=True,
+        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
+        persistent_workers=NUM_WORKERS > 0,
+    )
+
 
 TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2")
 # arm in ("routed7", "routed8"): nlp tokenizer retrained on OpenWebText (see
@@ -258,12 +282,13 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
         raise ValueError(f"scale=large supports mot/baseline/routed/routed3/routed7/routed10/routed14, not {arm}")
     if arm == "mot":
         return MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    if arm in ("routed", "routed8", "routed9", "routed15", "routed17", "routed18"):
+    if arm in ("routed", "routed8", "routed9", "routed15", "routed17", "routed18", "routed19"):
         # routed8/routed9: identical architecture to plain routed - only the nlp data source
         # (OpenWebText or PG-19 books, applied by _apply_openwebtext_nlp_source /
         # _apply_books_nlp_source in calibrate()/train()) and, for routed9, the warm-start +
-        # mixture upweighting, differ. routed15 (control), routed17/18 (diet-phase data levers)
-        # are the same story - no architecture change, only data/LR treatment differs.
+        # mixture upweighting, differ. routed15 (control), routed17/18 (diet-phase data levers),
+        # routed19 (curriculum + corrected token budget) are the same story - no architecture
+        # change, only data/LR/step-count treatment differs.
         return MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     if arm == "routed11":  # Bet 1: copy gate on the nlp head, warm-started from routed8
         return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
@@ -323,18 +348,18 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
     if arm in ("mot", "hybrid"):
         domains = list(bundle.domain_vocab_sizes)
         loaders = {
-            d: iter(DataLoader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+            d: iter(_loader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
     if arm in ("routed9", "routed10"):
-        loader = iter(DataLoader(PackedRoutedStream(
+        loader = iter(_loader(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
     elif arm in DIET_ARMS:
         # routed17: nlp upweighted to ~70%, no filter. routed18: same upweighting, PLUS only
         # copy-structured documents (see _is_copy_structured in stage2_routed_stream.py).
-        loader = iter(DataLoader(PackedRoutedStream(
+        loader = iter(_loader(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
             force_domain_filter=(COPY_MINE_MIN_WORD_LEN, COPY_MINE_MIN_GAP) if arm == "routed18" else None,
@@ -347,22 +372,31 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
         # not hypothetical. force_domain guarantees nlp's PRESENCE every batch (default
         # snippet_words, no upweighting - unlike routed17/18, routed16 isn't a mixture-share
         # bet, it just needs the copy-gate mechanism to always have something to learn from).
-        loader = iter(DataLoader(PackedRoutedStream(
+        loader = iter(_loader(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"], force_domain="nlp",
         ), batch_size=BATCH_SIZE))
     elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
-        loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_loader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
-        loader = iter(DataLoader(PackedRoutedStream(
+        loader = iter(_loader(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             min_domains=ROUTED3_MIN_DOMAINS, max_domains=ROUTED3_MAX_DOMAINS,
             snippet_words=ROUTED3_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
+    elif arm == "routed19":
+        phase1_loader = iter(_loader(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"],
+            min_domains=1, max_domains=1, snippet_words=ROUTED19_PHASE1_SNIPPET_WORDS,
+        ), batch_size=ROUTED19_BATCH_SIZE))
+        phase2_loader = iter(_loader(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"],
+        ), batch_size=ROUTED19_BATCH_SIZE))
+        routed19_phase1_steps = round(steps * ROUTED19_PHASE1_FRACTION)
     elif arm in ("routed4", "routed6"):  # both use 2x context
-        loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, LONGCTX_MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_loader(PackedRoutedStream(bundle, domain_index, LONGCTX_MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm not in ("mot",):
         encode_fn = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
-        loader = iter(DataLoader(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_loader(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
 
     t0 = time.time()
     for step in range(1, steps + 1):
@@ -394,6 +428,12 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
                                      switch_weight=SWITCH_WEIGHT, adv_lambda=1.0)
                 else:
                     loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
+        elif arm == "routed19":
+            src = phase1_loader if step <= routed19_phase1_steps else phase2_loader
+            tok, dom, ctrl, typ, tgt = next(src)
+            tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
+            with torch.autocast("cuda"):
+                loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
         else:
             ids = next(loader).to(device)
             inp, tgt = ids[:, :-1], ids[:, 1:]
@@ -538,18 +578,18 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     if arm in ("mot", "hybrid"):
         domains = list(bundle.domain_vocab_sizes)
         loaders = {
-            d: iter(DataLoader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+            d: iter(_loader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
     if arm in ("routed9", "routed10"):
-        loader = iter(DataLoader(PackedRoutedStream(
+        loader = iter(_loader(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
     elif arm in DIET_ARMS:
         # routed17: nlp upweighted to ~70%, no filter. routed18: same upweighting, PLUS only
         # copy-structured documents (see _is_copy_structured in stage2_routed_stream.py).
-        loader = iter(DataLoader(PackedRoutedStream(
+        loader = iter(_loader(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
             force_domain_filter=(COPY_MINE_MIN_WORD_LEN, COPY_MINE_MIN_GAP) if arm == "routed18" else None,
@@ -562,22 +602,33 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         # not hypothetical. force_domain guarantees nlp's PRESENCE every batch (default
         # snippet_words, no upweighting - unlike routed17/18, routed16 isn't a mixture-share
         # bet, it just needs the copy-gate mechanism to always have something to learn from).
-        loader = iter(DataLoader(PackedRoutedStream(
+        loader = iter(_loader(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"], force_domain="nlp",
         ), batch_size=BATCH_SIZE))
     elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
-        loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_loader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
-        loader = iter(DataLoader(PackedRoutedStream(
+        loader = iter(_loader(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             min_domains=ROUTED3_MIN_DOMAINS, max_domains=ROUTED3_MAX_DOMAINS,
             snippet_words=ROUTED3_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
+    elif arm == "routed19":
+        phase1_loader = iter(_loader(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"],
+            min_domains=1, max_domains=1, snippet_words=ROUTED19_PHASE1_SNIPPET_WORDS,
+        ), batch_size=ROUTED19_BATCH_SIZE))
+        phase2_loader = iter(_loader(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"],
+        ), batch_size=ROUTED19_BATCH_SIZE))
+        routed19_phase1_steps = round(total_steps * ROUTED19_PHASE1_FRACTION)
+        print(f"routed19 curriculum: phase 1 (single-domain) steps 1-{routed19_phase1_steps}, "
+              f"phase 2 (switching) steps {routed19_phase1_steps + 1}-{total_steps}", flush=True)
     elif arm in ("routed4", "routed6"):  # both use 2x context
-        loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, LONGCTX_MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_loader(PackedRoutedStream(bundle, domain_index, LONGCTX_MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm not in ("mot",):
         encode_fn = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
-        loader = iter(DataLoader(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_loader(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
 
     controller = None
     if arm in ("pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4"):
@@ -599,7 +650,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
 
     val_iter = None
     if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4", "routed5",
-               "routed6", "routed7", "routed8", "routed9", "routed10") + BET_ARMS + DIET_ARMS:
+               "routed6", "routed7", "routed8", "routed9", "routed10", "routed19") + BET_ARMS + DIET_ARMS:
         rs3 = arm == "routed3"
         books_upweighted = arm in ("routed9", "routed10")
         diet_upweighted = arm in DIET_ARMS
@@ -614,7 +665,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                                          DIET_PHASE2_NLP_SNIPPET_WORDS if diet_upweighted else None),
             force_domain_filter=(COPY_MINE_MIN_WORD_LEN, COPY_MINE_MIN_GAP) if arm == "routed18" else None,
         )
-        val_iter = iter(DataLoader(val_stream, batch_size=BATCH_SIZE))
+        val_iter = iter(_loader(val_stream, batch_size=ROUTED19_BATCH_SIZE if arm == "routed19" else BATCH_SIZE))
 
     def _held_out_ce():
         model.eval()
@@ -663,6 +714,15 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                 if step % LOG_EVERY == 0:
                     print(f"step {step}/{total_steps}  SKIPPED (no nlp tokens in window)", flush=True)
                 continue
+            tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
+            with torch.autocast("cuda"):
+                loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
+        elif arm == "routed19":
+            # step, not an internal call counter, drives the phase switch - correct across
+            # resumes (start_step is loaded from the checkpoint), unlike a loader-internal
+            # counter that would reset to 0 and misjudge the phase on every restart.
+            src = phase1_loader if step <= routed19_phase1_steps else phase2_loader
+            tok, dom, ctrl, typ, tgt = next(src)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
@@ -773,7 +833,7 @@ if __name__ == "__main__":
                          choices=["mot", "baseline", "sota", "routed", "pooled", "hybrid", "pooled2",
                                   "routed2", "routed3", "routed4", "routed5", "routed6", "routed7",
                                   "routed8", "routed9", "routed10", "routed11", "routed12", "routed13",
-                                  "routed14", "routed15", "routed16", "routed17", "routed18"])
+                                  "routed14", "routed15", "routed16", "routed17", "routed18", "routed19"])
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--scale", choices=["base", "large"], default="base",
                          help="'large' (mot/baseline only) uses LARGE_MODEL_CFG for the scale test")

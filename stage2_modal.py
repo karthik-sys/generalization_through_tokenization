@@ -610,9 +610,10 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
         # scores it against text it never saw (see _apply_openwebtext_nlp_source in
         # train_stage2_pod.py for the full rationale - code/math/science untouched).
         STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
-    elif arm in ("routed8", "routed11", "routed12", "routed13", "routed15", "routed16", "routed17", "routed18"):
+    elif arm in ("routed8", "routed11", "routed12", "routed13", "routed15", "routed16", "routed17", "routed18", "routed19"):
         # all base scale (unlike routed7) - routed11-18 are all continued-training runs from
-        # routed8, so they reuse its exact nlp source override.
+        # routed8, so they reuse its exact nlp source override. routed19 is from scratch but
+        # uses the same OWT nlp source (same tokenizer, same design as routed8).
         STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
     elif arm == "routed14":
         MODEL_CFG = LARGE_MODEL_CFG  # routed14 is always large-scale (warm-started from routed7)
@@ -806,7 +807,7 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
         tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
         nlp_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp"
                             if arm in ("routed7", "routed8", "routed11", "routed12", "routed13", "routed14",
-                                        "routed15", "routed16", "routed17", "routed18") else
+                                        "routed15", "routed16", "routed17", "routed18", "routed19") else
                             (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None)),
     )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
@@ -814,10 +815,10 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4",
                              "routed7", "routed8", "routed9", "routed10", "routed11", "routed12", "routed13", "routed14",
-                             "routed15", "routed16", "routed17", "routed18")
+                             "routed15", "routed16", "routed17", "routed18", "routed19")
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    elif arm in ("routed", "routed7", "routed8", "routed9", "routed10", "routed15", "routed17", "routed18"):
+    elif arm in ("routed", "routed7", "routed8", "routed9", "routed10", "routed15", "routed17", "routed18", "routed19"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed11", "routed14", "routed16"):
         model = MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
@@ -1077,7 +1078,7 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
         tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
         nlp_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp"
                             if arm in ("routed7", "routed8", "routed11", "routed12", "routed13", "routed14",
-                                        "routed15", "routed16", "routed17", "routed18") else
+                                        "routed15", "routed16", "routed17", "routed18", "routed19") else
                             (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None)),
     )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
@@ -1085,10 +1086,10 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4",
                              "routed7", "routed8", "routed9", "routed10", "routed11", "routed12", "routed13", "routed14",
-                             "routed15", "routed16", "routed17", "routed18")
+                             "routed15", "routed16", "routed17", "routed18", "routed19")
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    elif arm in ("routed", "routed7", "routed8", "routed9", "routed10", "routed15", "routed17", "routed18"):
+    elif arm in ("routed", "routed7", "routed8", "routed9", "routed10", "routed15", "routed17", "routed18", "routed19"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed11", "routed14", "routed16"):
         model = MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
@@ -1554,7 +1555,7 @@ def generate(arm: str = "mot", checkpoint_step: int = 150000, seed_domain: str =
 
 
 @app.local_entrypoint()
-def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from: str = "", noisy: bool = False, scale: str = "base"):
+def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from: str = "", noisy: bool = False, scale: str = "base", n_examples: int = 500):
     """steps=0 means "use the default": 150 for calibrate, MAX_STEPS for train."""
     if step == "sample-tokenizers":
         sample_tokenizers.remote()
@@ -1577,11 +1578,12 @@ def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from:
         history = train.remote(arm=arm, max_steps=steps or None, resume_from=resume_from or None)
         print(f"\nfinal logged losses: {history[-5:] if history else '(none)'}")
     elif step == "evaluate-lambada":
-        result = evaluate_lambada.remote(arm=arm, checkpoint_step=steps or 150000, scale=scale)
+        result = evaluate_lambada.remote(arm=arm, checkpoint_step=steps or 150000, scale=scale, n_examples=n_examples)
         print(f"\nLAMBADA for {arm}: accuracy={result['accuracy']:.4f}  "
               f"stop-word-filtered accuracy={result['accuracy_stopword_filtered']:.4f}  "
               f"target-token ppl={result['target_token_ppl']:.2f}  "
-              f"bits/target-token={result['bits_per_target_token']:.3f}")
+              f"bits/target-token={result['bits_per_target_token']:.3f}  "
+              f"(n_scored={result['n_scored']}, n_skipped={result['n_skipped']})")
     elif step == "generate":
         generate.remote(arm=arm, checkpoint_step=steps or 150000, seed_domain=resume_from or "science")
     elif step == "diagnose-lambada":

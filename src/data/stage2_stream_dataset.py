@@ -17,7 +17,8 @@ from typing import Iterator
 
 import torch
 from datasets import load_dataset
-from torch.utils.data import IterableDataset
+from datasets.distributed import split_dataset_by_node
+from torch.utils.data import IterableDataset, get_worker_info
 
 from src.model.stage2_config import CODE_LICENSE_ALLOWLIST, DOMAIN_TAG, STREAM_SOURCES
 
@@ -53,12 +54,20 @@ def _raw_doc_stream(domain: str) -> Iterator[str]:
     tag = DOMAIN_TAG[domain]
     extractor = TEXT_EXTRACTORS[domain]
     pass_num = 0
+    # Resolved lazily (inside this generator's body, not at construction time) so it reflects
+    # the actual worker this generator is running in - DataLoader(num_workers>1) calls
+    # __iter__ once per worker PROCESS, and without sharding every worker would independently
+    # replay the exact same stream from the same starting point (duplicate documents, not more
+    # throughput) rather than each covering a distinct slice of the source.
+    worker_info = get_worker_info()
     while True:
         stream = load_dataset(
             cfg["path"], name=cfg.get("name"), data_dir=cfg.get("data_dir"),
             revision=cfg.get("revision"), data_files=cfg.get("data_files"),
             split="train", streaming=True,
         )
+        if worker_info is not None and worker_info.num_workers > 1:
+            stream = split_dataset_by_node(stream, rank=worker_info.id, world_size=worker_info.num_workers)
         if pass_num:
             stream = stream.shuffle(seed=pass_num, buffer_size=1000)
             print(f"[stream] {domain}: source exhausted, restarting (pass {pass_num + 1})", flush=True)
