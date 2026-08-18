@@ -712,7 +712,22 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                       f"guard tripped)  {controller.state()}", flush=True)
             continue
 
-        scaler.scale(loss / GRAD_ACCUM_STEPS).backward()
+        try:
+            scaler.scale(loss / GRAD_ACCUM_STEPS).backward()
+        except RuntimeError as e:
+            # Belt-and-braces for FROZEN_BACKBONE_ARMS: the upstream domain-presence guard
+            # (above) reduces how often a batch's loss ends up disconnected from every
+            # trainable tensor, but didn't eliminate it in practice (observed live on
+            # routed16 - crashed again post-guard at a batch that DID contain nlp-domain
+            # positions, so the exact internal trigger wasn't fully pinned down). Catch the
+            # actual symptom directly rather than keep chasing the precise precondition.
+            if "does not require grad" not in str(e):
+                raise
+            if step % LOG_EVERY == 0:
+                print(f"step {step}/{total_steps}  SKIPPED backward (loss disconnected from "
+                      f"every trainable tensor)", flush=True)
+            opt.zero_grad()
+            continue
         running += loss_val
         running_n += 1
         if step % GRAD_ACCUM_STEPS == 0:
