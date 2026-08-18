@@ -33,15 +33,20 @@ from src.model.mot_model import MoTModel
 from src.model.mot_pooled2_model import MoTPooled2Model
 from src.model.mot_pooled_model import MoTPooledModel
 from src.model.mot_routed_combined_model import MoTRoutedCombinedModel
+from src.model.mot_routed_copygate_model import MoTRoutedCopyGateModel
 from src.model.mot_routed_decoupled_model import MoTRoutedDecoupledModel
+from src.model.mot_routed_deepexpert_model import DEFAULT_N_EXPERT_LAYERS, MoTRoutedDeepExpertModel
 from src.model.mot_routed_model import MoTRoutedModel
+from src.model.mot_routed_precision_model import MoTRoutedPrecisionModel
 from src.model.stage2_config import (
-    ADV_LAMBDA_RAMP_STEPS, ARM_LABELS, BACKBONE_ONLY_CFG, BATCH_SIZE, BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS,
-    CHECKPOINT_EVERY, CONFIDENCE_WEIGHT, COOLDOWN_BACKBONE_LR_SCALE, FOCAL_GAMMA, GRAD_ACCUM_STEPS,
-    HYBRID_NATURAL_DATA_FRACTION, LOG_EVERY, LONGCTX_MODEL_CFG, LR, MAX_STEPS, MODEL_CFG,
-    ROUTED3_MAX_DOMAINS, ROUTED3_MIN_DOMAINS, ROUTED3_SNIPPET_WORDS, SWITCH_WEIGHT, WARM_START_PARENT,
-    WARMUP_STEPS,
+    ADV_LAMBDA_RAMP_STEPS, ARM_LABELS, BACKBONE_ONLY_CFG, BATCH_SIZE, BET_BACKBONE_LR_SCALE,
+    BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS, CHECKPOINT_EVERY, CONFIDENCE_WEIGHT, COOLDOWN_BACKBONE_LR_SCALE,
+    FOCAL_GAMMA, GRAD_ACCUM_STEPS, HYBRID_NATURAL_DATA_FRACTION, LOG_EVERY, LONGCTX_MODEL_CFG, LR,
+    MAX_STEPS, MODEL_CFG, NEW_MODULE_MATCH, ROUTED3_MAX_DOMAINS, ROUTED3_MIN_DOMAINS,
+    ROUTED3_SNIPPET_WORDS, SWITCH_WEIGHT, WARM_START_PARENT, WARMUP_STEPS,
 )
+
+BET_ARMS = ("routed11", "routed12", "routed13")  # copy-gate, deep-experts, precision-head
 
 TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2")
 # arm in ("routed7", "routed8"): nlp tokenizer retrained on OpenWebText (see
@@ -128,29 +133,38 @@ def _apply_books_nlp_source() -> None:
     print("[routed9/10] nlp domain source overridden: FineWeb -> deepmind/pg19", flush=True)
 
 
-def _warm_start_from_parent(model, parent_ckpt_prefix: str, device: str) -> bool:
-    """arms routed9/routed10: initialize from the parent arm's latest checkpoint instead of
-    random init, EXCEPT the nlp domain's embedding/type_embedding/projection/head. Those
-    describe token ids under the PARENT's nlp tokenizer (FineWeb- or OpenWebText-fit) - a
-    different vocabulary than routed9/routed10's PG-19-fit tokenizer, even though the tensor
-    SHAPES match (same NLP_*_VOCAB constants everywhere). Loading them would be confidently
-    wrong, not just stale, so they're left at fresh random init instead. The shared backbone
-    and code/math/science tables are untouched by the nlp tokenizer swap and transfer directly.
-    """
+def _latest_parent_checkpoint(parent_ckpt_prefix: str):
     import glob
     import re
     paths = glob.glob(str(CKPT_DIR / f"{parent_ckpt_prefix}_step*.pt"))
     if not paths:
+        return None
+    return sorted(paths, key=lambda p: int(re.search(r"step(\d+)", p).group(1)), reverse=True)[0]
+
+
+def _warm_start_from_parent(model, parent_ckpt_prefix: str, device: str,
+                             skip_prefixes: tuple[str, ...] = _NLP_PARAM_PREFIXES) -> bool:
+    """arms routed9/routed10/routed11/routed12/routed13: initialize from the parent arm's
+    latest checkpoint instead of random init. skip_prefixes lists key prefixes to leave at
+    fresh init rather than load - for routed9/10 that's the nlp domain's embedding/type_
+    embedding/projection/head (they describe token ids under a DIFFERENT nlp tokenizer than
+    the parent's, so loading them would be confidently wrong, not just stale, even though the
+    tensor shapes match). routed11/12/13 reuse routed8's exact tokenizer, so they pass
+    skip_prefixes=() - nothing needs skipping, and any genuinely NEW key (a bet's own new
+    module, e.g. copy_q/copy_gate) simply isn't in the parent checkpoint at all, so it's
+    never touched by this loop and stays at its own model's fresh init automatically.
+    """
+    latest = _latest_parent_checkpoint(parent_ckpt_prefix)
+    if latest is None:
         print(f"WARNING: no parent checkpoint found for prefix '{parent_ckpt_prefix}' in "
               f"{CKPT_DIR} - starting from random init instead of a warm start", flush=True)
         return False
-    latest = sorted(paths, key=lambda p: int(re.search(r"step(\d+)", p).group(1)), reverse=True)[0]
     parent_ckpt = torch.load(latest, map_location=device)
     parent_state = parent_ckpt["model"]
     own_state = model.state_dict()
     loaded, skipped = 0, 0
     for k, v in parent_state.items():
-        if k.startswith(_NLP_PARAM_PREFIXES):
+        if skip_prefixes and k.startswith(skip_prefixes):
             skipped += 1
             continue
         if k in own_state and own_state[k].shape == v.shape:
@@ -160,7 +174,56 @@ def _warm_start_from_parent(model, parent_ckpt_prefix: str, device: str) -> bool
             print(f"  warm-start: key '{k}' missing/shape-mismatched in child model, skipping", flush=True)
     model.load_state_dict(own_state)
     print(f"warm-started from {latest} (parent step {parent_ckpt['step']}): "
-          f"{loaded} tensors loaded, {skipped} nlp-domain tensors left at fresh init", flush=True)
+          f"{loaded} tensors loaded, {skipped} tensors left at fresh init", flush=True)
+    return True
+
+
+def _warm_start_deep_expert(model, parent_ckpt_prefix: str, device: str, n_shared: int) -> bool:
+    """arm routed12 only: like _warm_start_from_parent, but the backbone's key NAMES changed
+    shape (plain backbone.blocks.{i}.* -> backbone.shared_blocks.{i}.* for i<n_shared, or
+    backbone.expert_blocks.{i-n_shared}.{...}* / .ffn.ffn.{...}* for i>=n_shared, since the
+    expert layers' FFN got wrapped in DomainLoRAFFN - see mot_routed_deepexpert_model.py).
+    Remaps parent keys to their child-equivalent names before loading, rather than relying on
+    exact key match. Verified via a real state_dict test: 0 mismatched, 0 missing, only the
+    new (fresh-init) lora_a/lora_b keys are absent from the remapped parent - see commit
+    history for the standalone test this was checked against before wiring it in here.
+    """
+    latest = _latest_parent_checkpoint(parent_ckpt_prefix)
+    if latest is None:
+        print(f"WARNING: no parent checkpoint found for prefix '{parent_ckpt_prefix}' in "
+              f"{CKPT_DIR} - starting from random init instead of a warm start", flush=True)
+        return False
+    parent_ckpt = torch.load(latest, map_location=device)
+    parent_state = parent_ckpt["model"]
+    remapped = {}
+    for k, v in parent_state.items():
+        if k.startswith("backbone.blocks."):
+            rest = k[len("backbone.blocks."):]
+            idx_str, tail = rest.split(".", 1)
+            idx = int(idx_str)
+            if idx < n_shared:
+                remapped[f"backbone.shared_blocks.{idx}.{tail}"] = v
+            else:
+                eidx = idx - n_shared
+                if tail.startswith("ffn."):
+                    remapped[f"backbone.expert_blocks.{eidx}.ffn.ffn.{tail[len('ffn.'):]}"] = v
+                else:
+                    remapped[f"backbone.expert_blocks.{eidx}.{tail}"] = v
+        else:
+            remapped[k] = v
+    own_state = model.state_dict()
+    loaded, skipped = 0, 0
+    for k, v in remapped.items():
+        if k in own_state and own_state[k].shape == v.shape:
+            own_state[k] = v
+            loaded += 1
+        else:
+            skipped += 1
+            print(f"  warm-start: key '{k}' missing/shape-mismatched in child model, skipping", flush=True)
+    model.load_state_dict(own_state)
+    print(f"warm-started (deep-expert remap) from {latest} (parent step {parent_ckpt['step']}): "
+          f"{loaded} tensors loaded, {skipped} skipped, "
+          f"{len(own_state) - loaded} total child tensors left at fresh init (new LoRA adapters)", flush=True)
     return True
 
 
@@ -191,6 +254,12 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
         # _apply_books_nlp_source in calibrate()/train()) and, for routed9, the warm-start +
         # mixture upweighting, differ.
         return MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    if arm == "routed11":  # Bet 1: copy gate on the nlp head, warm-started from routed8
+        return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    if arm == "routed12":  # Bet 2: per-domain LoRA on the top layers, warm-started from routed8
+        return MoTRoutedDeepExpertModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    if arm == "routed13":  # Bet 3 (exploratory): precision/margin head, warm-started from routed8
+        return MoTRoutedPrecisionModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     if arm == "pooled":
         return MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
                                focal_gamma=FOCAL_GAMMA, confidence_weight=CONFIDENCE_WEIGHT).to(device)
@@ -223,12 +292,12 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
     print(f"CUDA available: {torch.cuda.is_available()}  device: {torch.cuda.get_device_name(0)}", flush=True)
     if arm in ("routed7", "routed10"):
         scale = "large"  # always large-scale, regardless of what --scale was passed
-    if arm in ("routed7", "routed8"):
-        _apply_openwebtext_nlp_source()
+    if arm in ("routed7", "routed8") + BET_ARMS:
+        _apply_openwebtext_nlp_source()  # routed11/12/13 reuse routed8's exact nlp source
     if arm in ("routed9", "routed10"):
         _apply_books_nlp_source()
 
-    nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in ("routed7", "routed8") else \
+    nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in ("routed7", "routed8") + BET_ARMS else \
         (BOOKS_NLP_TOKENIZER_DIR if arm in ("routed9", "routed10") else None)
     bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR, nlp_tokenizer_dir=nlp_tok_dir)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
@@ -248,7 +317,7 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
-    elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8"):
+    elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
         loader = iter(DataLoader(PackedRoutedStream(
@@ -283,7 +352,7 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
-        elif arm in ("routed", "pooled", "pooled2", "routed5", "routed6", "routed7", "routed8", "routed9", "routed10"):
+        elif arm in ("routed", "pooled", "pooled2", "routed5", "routed6", "routed7", "routed8", "routed9", "routed10") + BET_ARMS:
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
@@ -322,12 +391,12 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     print(f"ARM: {arm}  =  {ARM_LABELS.get(arm, arm)}", flush=True)
     if arm in ("routed7", "routed10"):
         scale = "large"  # always large-scale, regardless of what --scale was passed
-    if arm in ("routed7", "routed8"):
-        _apply_openwebtext_nlp_source()
+    if arm in ("routed7", "routed8") + BET_ARMS:
+        _apply_openwebtext_nlp_source()  # routed11/12/13 reuse routed8's exact nlp source
     if arm in ("routed9", "routed10"):
         _apply_books_nlp_source()
 
-    nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in ("routed7", "routed8") else \
+    nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in ("routed7", "routed8") + BET_ARMS else \
         (BOOKS_NLP_TOKENIZER_DIR if arm in ("routed9", "routed10") else None)
     bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR, nlp_tokenizer_dir=nlp_tok_dir)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
@@ -339,12 +408,24 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     # fast without the warm-started backbone/other-domain tables being dragged along at the
     # same rate - COOLDOWN_BACKBONE_LR_SCALE (0.1) throttles the latter, applied per-step below
     # alongside the normal cosine schedule via each param group's "lr_scale".
-    if arm in WARM_START_PARENT:
+    # routed11/12/13 ("bet" arms): nothing is reinitialized (same tokenizer as routed8), so
+    # only each bet's OWN new module (matched via NEW_MODULE_MATCH) needs full LR - everything
+    # else already trained gets BET_BACKBONE_LR_SCALE, a gentler throttle than the cooldown
+    # arms' since there's no fresh-init branch racing to catch up here.
+    if arm in WARM_START_PARENT and arm not in NEW_MODULE_MATCH:
         nlp_params = [p for n, p in model.named_parameters() if n.startswith(_NLP_PARAM_PREFIXES)]
         other_params = [p for n, p in model.named_parameters() if not n.startswith(_NLP_PARAM_PREFIXES)]
         opt = torch.optim.AdamW([
             {"params": nlp_params, "lr_scale": 1.0},
             {"params": other_params, "lr_scale": COOLDOWN_BACKBONE_LR_SCALE},
+        ], lr=LR)
+    elif arm in NEW_MODULE_MATCH:
+        match = NEW_MODULE_MATCH[arm]
+        new_params = [p for n, p in model.named_parameters() if any(s in n for s in match)]
+        old_params = [p for n, p in model.named_parameters() if not any(s in n for s in match)]
+        opt = torch.optim.AdamW([
+            {"params": new_params, "lr_scale": 1.0},
+            {"params": old_params, "lr_scale": BET_BACKBONE_LR_SCALE},
         ], lr=LR)
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=LR)
@@ -361,20 +442,34 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
 
     start_step = 1
     resumed_own = False
+    resumed_history: list = []
     for cand in _latest_checkpoint():
         try:
             ckpt = torch.load(cand, map_location=device)
             model.load_state_dict(ckpt["model"])
             opt.load_state_dict(ckpt["opt"])
             start_step = ckpt["step"] + 1
-            print(f"resumed from {cand} at step {start_step}", flush=True)
+            # Extend (never reset) the loss-curve history on resume - a bare `history = []`
+            # here silently discarded every prior restart's data (real bug, confirmed: routed8's
+            # checkpoint only had ~172k steps of history despite being at step 496k, all from
+            # its most recent restart). Every pod restart (migrations, watchdog auto-restarts)
+            # used to erase everything before it.
+            resumed_history = ckpt.get("history", [])
+            print(f"resumed from {cand} at step {start_step} "
+                  f"({len(resumed_history)} history entries carried forward)", flush=True)
             resumed_own = True
             break
         except Exception as e:
             print(f"checkpoint {cand} failed to load ({type(e).__name__}: {e}); trying older", flush=True)
             continue
     if not resumed_own:
-        warm_started = arm in WARM_START_PARENT and _warm_start_from_parent(model, WARM_START_PARENT[arm], device)
+        warm_started = False
+        if arm == "routed12":
+            warm_started = _warm_start_deep_expert(
+                model, WARM_START_PARENT[arm], device, n_shared=MODEL_CFG["n_layers"] - DEFAULT_N_EXPERT_LAYERS)
+        elif arm in WARM_START_PARENT:
+            skip = _NLP_PARAM_PREFIXES if arm in ("routed9", "routed10") else ()
+            warm_started = _warm_start_from_parent(model, WARM_START_PARENT[arm], device, skip_prefixes=skip)
         if not warm_started:
             print(f"no checkpoint found for {arm} in {CKPT_DIR} - starting from step 1", flush=True)
 
@@ -395,7 +490,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
-    elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8"):
+    elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
         loader = iter(DataLoader(PackedRoutedStream(
@@ -429,7 +524,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
 
     val_iter = None
     if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4", "routed5",
-               "routed6", "routed7", "routed8", "routed9", "routed10"):
+               "routed6", "routed7", "routed8", "routed9", "routed10") + BET_ARMS:
         rs3 = arm == "routed3"
         upweighted = arm in ("routed9", "routed10")
         seq_len = LONGCTX_MODEL_CFG["max_seq_len"] if arm in ("routed4", "routed6") else MODEL_CFG["max_seq_len"]
@@ -466,7 +561,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
 
     t0 = time.time()
     running, running_n = 0.0, 0
-    history = []
+    history = resumed_history
     for step in range(start_step, total_steps + 1):
         lr_mult = controller.lr_mult if controller is not None else 1.0
         for g in opt.param_groups:
@@ -480,7 +575,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             with torch.autocast("cuda"):
                 logits = model(domain, inp, types[:, :-1])
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
-        elif arm in ("routed", "routed7", "routed8", "routed9", "routed10"):
+        elif arm in ("routed", "routed7", "routed8", "routed9", "routed10") + BET_ARMS:
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
@@ -576,7 +671,7 @@ if __name__ == "__main__":
     parser.add_argument("--arm", required=True,
                          choices=["mot", "baseline", "sota", "routed", "pooled", "hybrid", "pooled2",
                                   "routed2", "routed3", "routed4", "routed5", "routed6", "routed7",
-                                  "routed8", "routed9", "routed10"])
+                                  "routed8", "routed9", "routed10", "routed11", "routed12", "routed13"])
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--scale", choices=["base", "large"], default="base",
                          help="'large' (mot/baseline only) uses LARGE_MODEL_CFG for the scale test")

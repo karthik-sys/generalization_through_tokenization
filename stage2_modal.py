@@ -591,7 +591,10 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     from src.model.mot_pooled2_model import MoTPooled2Model
     from src.model.mot_pooled_model import MoTPooledModel
     from src.model.mot_routed_combined_model import MoTRoutedCombinedModel
+    from src.model.mot_routed_copygate_model import MoTRoutedCopyGateModel
+    from src.model.mot_routed_deepexpert_model import MoTRoutedDeepExpertModel
     from src.model.mot_routed_model import MoTRoutedModel
+    from src.model.mot_routed_precision_model import MoTRoutedPrecisionModel
     from src.model.stage2_config import (
         BACKBONE_ONLY_CFG, BATCH_SIZE, CONFIDENCE_WEIGHT, FOCAL_GAMMA, LARGE_BACKBONE_ONLY_CFG,
         LARGE_MODEL_CFG, LONGCTX_MODEL_CFG, MODEL_CFG, STREAM_SOURCES,
@@ -607,8 +610,9 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
         # scores it against text it never saw (see _apply_openwebtext_nlp_source in
         # train_stage2_pod.py for the full rationale - code/math/science untouched).
         STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
-    elif arm == "routed8":
-        # routed8 stays BASE scale (unlike routed7) - only the nlp source override applies.
+    elif arm in ("routed8", "routed11", "routed12", "routed13"):
+        # all base scale (unlike routed7) - routed11/12/13 are continued-training bets from
+        # routed8, so they reuse its exact nlp source override.
         STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
     elif arm == "routed10":
         MODEL_CFG = LARGE_MODEL_CFG  # routed10 is always large-scale, regardless of --scale
@@ -796,18 +800,25 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
 
     bundle = TokenizerBundle(
         tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
-        nlp_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp" if arm in ("routed7", "routed8") else
+        nlp_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp"
+                            if arm in ("routed7", "routed8", "routed11", "routed12", "routed13") else
                             (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None)),
     )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4",
-                             "routed7", "routed8", "routed9", "routed10")  # arms with disjoint per-domain heads
+                             "routed7", "routed8", "routed9", "routed10", "routed11", "routed12", "routed13")
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed", "routed7", "routed8", "routed9", "routed10"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "routed11":
+        model = MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "routed12":
+        model = MoTRoutedDeepExpertModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "routed13":
+        model = MoTRoutedPrecisionModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "pooled":
         model = MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
                                focal_gamma=FOCAL_GAMMA, confidence_weight=CONFIDENCE_WEIGHT).to(device)
@@ -1024,7 +1035,10 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     from src.model.mot_pooled2_model import MoTPooled2Model
     from src.model.mot_pooled_model import MoTPooledModel
     from src.model.mot_routed_combined_model import MoTRoutedCombinedModel
+    from src.model.mot_routed_copygate_model import MoTRoutedCopyGateModel
+    from src.model.mot_routed_deepexpert_model import MoTRoutedDeepExpertModel
     from src.model.mot_routed_model import MoTRoutedModel
+    from src.model.mot_routed_precision_model import MoTRoutedPrecisionModel
     from src.model.stage2_config import (
         BACKBONE_ONLY_CFG, CONFIDENCE_WEIGHT, FOCAL_GAMMA, LARGE_BACKBONE_ONLY_CFG, LARGE_MODEL_CFG,
         LONGCTX_MODEL_CFG, MODEL_CFG,
@@ -1038,8 +1052,8 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
         scale = "large"
         # (no STREAM_SOURCES override needed here, unlike evaluate() - LAMBADA always reads
         # from the fixed EleutherAI/lambada_openai benchmark, never from STREAM_SOURCES)
-    elif arm == "routed8":
-        pass  # routed8 stays BASE scale - only the nlp tokenizer dir below differs
+    elif arm in ("routed8", "routed11", "routed12", "routed13"):
+        pass  # all BASE scale - only the nlp tokenizer dir below differs
     elif arm == "routed10":
         MODEL_CFG = LARGE_MODEL_CFG  # routed10 is always large-scale, regardless of --scale
         scale = "large"
@@ -1052,18 +1066,25 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     seq_len = MODEL_CFG["max_seq_len"]
     bundle = TokenizerBundle(
         tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
-        nlp_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp" if arm in ("routed7", "routed8") else
+        nlp_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp"
+                            if arm in ("routed7", "routed8", "routed11", "routed12", "routed13") else
                             (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None)),
     )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4",
-                             "routed7", "routed8", "routed9", "routed10")
+                             "routed7", "routed8", "routed9", "routed10", "routed11", "routed12", "routed13")
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed", "routed7", "routed8", "routed9", "routed10"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "routed11":
+        model = MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "routed12":
+        model = MoTRoutedDeepExpertModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "routed13":
+        model = MoTRoutedPrecisionModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "pooled":
         model = MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
                                focal_gamma=FOCAL_GAMMA, confidence_weight=CONFIDENCE_WEIGHT).to(device)
@@ -1251,6 +1272,137 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
             "n_scored": n_scored, "n_skipped": n_skipped}
 
 
+@app.function(image=image, gpu="T4", volumes={VOLUME_PATH: volume}, timeout=1800,
+              secrets=[modal.Secret.from_name("huggingface-token")])
+def diagnose_lambada(arm: str = "routed8", checkpoint_step: int = 575000, n_examples: int = 300):
+    """The diagnostic Qwen-coder and this session both flagged as missing before committing
+    real GPU-weeks to bets 1-3: classify routed8's LAMBADA errors instead of guessing which
+    lever matters most by theory. Cheap (CPU-bound scoring on top of one eval pass, no
+    training), and its output should reweight - not replace - the three bets already launched.
+
+    Reuses evaluate_lambada's exact scoring loop (same context/target encoding, same
+    teacher-forced first-token prediction), simplified to one hardcoded arm since this is
+    specifically about routed8's error mass, not a general per-arm tool. For every WRONG
+    first-token prediction, classifies into (in priority order, first match wins):
+      - single_token_target: n_tgt==1 - informational tag, not an error class on its own,
+        recorded so the coverage stat (see below) is directly checkable against the taxonomy.
+      - copy_failure: the target word appears (case-insensitive substring) somewhere earlier
+        in the context - the model had the word available to retrieve and didn't. This is
+        the error class Bet 1 (copy gate) targets directly.
+      - near_miss: the true first target token ranked in the model's own top-5 by logit, just
+        not top-1 - a calibration/precision problem (mass spread across synonyms), the error
+        class Bet 3 (precision head) targets.
+      - other: neither - could be genuine lack of capacity/signal (Bet 2's territory) or a
+        rare/unseen word.
+
+    single_token_coverage is reported separately (fraction of ALL scored targets, correct or
+    not, that are exactly 1 token under the nlp tokenizer) - this bounds Bet 1/3's ceiling:
+    a multi-token target can still be a copy_failure/near_miss on its first piece, but exact-
+    match requires every piece right, so low coverage caps how much any single-token-focused
+    lever can move the headline number.
+    """
+    _setup_paths()
+    import os
+
+    os.chdir("/root/repo")
+    import math
+
+    import torch
+    from datasets import load_dataset
+
+    from src.data.build_examples import TokenizerBundle
+    from src.model.mot_routed_model import MoTRoutedModel
+    from src.model.stage2_config import DOMAIN_TAG, MODEL_CFG
+
+    device = "cuda"
+    bundle = TokenizerBundle(
+        tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
+        nlp_tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp",
+    )
+    domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
+    ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{arm}_step{checkpoint_step}.pt", map_location=device)
+    model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    print(f"loaded {arm} checkpoint at step {ckpt['step']}", flush=True)
+
+    ds = load_dataset("EleutherAI/lambada_openai", "en", split="test", streaming=True)
+    counts = {"single_token_target": 0, "copy_failure": 0, "near_miss": 0, "other": 0, "correct": 0}
+    n_scored, n_skipped = 0, 0
+    examples: list[dict] = []  # a handful of concrete examples per class, for manual spot-checking
+    with torch.no_grad():
+        for row in ds:
+            if n_scored >= n_examples:
+                break
+            text = row["text"]
+            if " " not in text.strip():
+                n_skipped += 1
+                continue
+            context, target_word = text.rsplit(" ", 1)
+            tagged_context = f"{DOMAIN_TAG['nlp']}\n{context} "
+            ctx_ids, ctx_types = bundle.encode_domain("nlp", tagged_context, max_len=10**9)
+            tgt_ids, tgt_types = bundle.encode_domain("nlp", target_word, max_len=10**9)
+            n_ctx, n_tgt = len(ctx_ids), len(tgt_ids)
+            if n_tgt == 0 or n_ctx == 0 or n_ctx + n_tgt > MODEL_CFG["max_seq_len"]:
+                n_skipped += 1
+                continue
+
+            full_ids = torch.cat([ctx_ids, tgt_ids]).unsqueeze(0).to(device)
+            full_types = torch.cat([ctx_types, tgt_types]).unsqueeze(0).to(device)
+            di = domain_index["nlp"]
+            with torch.autocast("cuda"):
+                dom = torch.full_like(full_ids[:, :-1], di)
+                ctrl = torch.zeros_like(full_ids[:, :-1])
+                out = model(full_ids[:, :-1], dom, ctrl, targets=None, type_ids=full_types[:, :-1])
+                _, logits = out["nlp"]
+
+            first_logits = logits[n_ctx - 1]
+            true_first = int(full_ids[0, n_ctx])
+            pred_first = int(first_logits.argmax())
+            n_scored += 1
+
+            if n_tgt == 1:
+                counts["single_token_target"] += 1
+
+            if pred_first == true_first:
+                counts["correct"] += 1
+                continue
+
+            if target_word.strip(".,;:!?\"'").lower() in context.lower():
+                cls = "copy_failure"
+            elif true_first in first_logits.topk(5).indices.tolist():
+                cls = "near_miss"
+            else:
+                cls = "other"
+            counts[cls] += 1
+            if sum(1 for e in examples if e["class"] == cls) < 5:
+                examples.append({
+                    "class": cls, "target": target_word,
+                    "context_tail": context[-120:],
+                })
+
+            if n_scored % 50 == 0:
+                print(f"  {n_scored}/{n_examples}  running: {counts}", flush=True)
+
+    n_wrong = n_scored - counts["correct"]
+    single_token_coverage = counts["single_token_target"] / max(n_scored, 1)
+    print(f"\nDIAGNOSTIC for {arm} (checkpoint step {ckpt['step']}), {n_scored} scored ({n_skipped} skipped):",
+          flush=True)
+    print(f"  single_token_coverage: {single_token_coverage:.3f} "
+          f"({counts['single_token_target']}/{n_scored} targets are exactly 1 nlp-tokenizer token)", flush=True)
+    print(f"  correct: {counts['correct']}/{n_scored} ({counts['correct']/max(n_scored,1):.3f})", flush=True)
+    for cls in ("copy_failure", "near_miss", "other"):
+        pct_of_wrong = counts[cls] / max(n_wrong, 1)
+        print(f"  {cls}: {counts[cls]}/{n_wrong} wrong ({pct_of_wrong:.3f}) -> "
+              f"{'Bet 1 (copy gate)' if cls == 'copy_failure' else 'Bet 3 (precision head)' if cls == 'near_miss' else 'Bet 2 / capacity or rare-word'}",
+              flush=True)
+    print("\nspot-check examples:", flush=True)
+    for e in examples:
+        print(f"  [{e['class']}] target={e['target']!r}  ...{e['context_tail']!r}", flush=True)
+
+    return {"n_scored": n_scored, "single_token_coverage": single_token_coverage, "counts": counts}
+
+
 @app.function(image=image, gpu="T4", volumes={VOLUME_PATH: volume}, timeout=900,
               secrets=[modal.Secret.from_name("huggingface-token")])
 def generate(arm: str = "mot", checkpoint_step: int = 150000, seed_domain: str = "science",
@@ -1421,5 +1573,7 @@ def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from:
               f"bits/target-token={result['bits_per_target_token']:.3f}")
     elif step == "generate":
         generate.remote(arm=arm, checkpoint_step=steps or 150000, seed_domain=resume_from or "science")
+    elif step == "diagnose-lambada":
+        diagnose_lambada.remote(arm=arm or "routed8", checkpoint_step=steps or 575000)
     else:
         raise ValueError(f"unknown step: {step}")

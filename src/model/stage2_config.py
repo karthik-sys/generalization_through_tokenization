@@ -153,6 +153,34 @@ ARM_LABELS = {
                "mixture share, not just data-source matching or raw volume",
     "routed10": "Routed, LARGE scale, warm-started from routed7's checkpoint - same books/upweight/"
                "cooldown treatment as routed9, at large scale. routed9's large-scale pair.",
+    "routed11": "Bet 1 (copy gate): routed8 + a pointer/copy mechanism on the nlp head - "
+               "warm-started, no reinit (same OWT tokenizer as routed8), continued training. "
+               "Targets LAMBADA's retrieval failure mode directly (target word often appears "
+               "earlier in the passage; a plain softmax head has to reconstruct it from scratch).",
+    "routed12": "Bet 2 (deep experts): routed8 + per-domain LoRA adapters on the top 2 "
+               "transformer layers (zero-init, no-op at warm-start) - tests whether the fully-"
+               "shared backbone's capacity, contended across 4 domains, is limiting the nlp head.",
+    "routed13": "Bet 3, exploratory (precision head): routed8 + a margin-trained second scoring "
+               "pathway over the nlp tokenizer's ~16k most-frequent surface tokens, blended "
+               "additively into the vocab logits via a learned gate - attacks the "
+               "calibration-vs-argmax gap (NLL spreads mass over synonyms; EM only rewards top-1) "
+               "directly, in-batch hard negatives instead of a periodic mining loop.",
+}
+
+# routed11/12/13 ("bet" arms, all warm-started from routed8@575k, no reinit - same OWT
+# tokenizer throughout, unlike routed9/10's tokenizer swap). Each adds ONE new small module;
+# everything already trained (backbone, embeddings, heads) trains at BET_BACKBONE_LR_SCALE so
+# routed8's weights aren't disturbed while the new mechanism catches up, mirroring routed9/10's
+# cooldown pattern but with a gentler backbone throttle since nothing here was reinitialized.
+# Match strings are checked via substring-containment against each param's full dotted name
+# (not startswith - routed12's LoRA keys are nested several levels deep, e.g.
+# "backbone.expert_blocks.0.ffn.lora_a.nlp.weight").
+BET_BACKBONE_LR_SCALE = 0.3
+BET_STEPS = 100000
+NEW_MODULE_MATCH = {
+    "routed11": ("copy_q.", "copy_k.", "copy_gate."),
+    "routed12": ("lora_a.", "lora_b."),
+    "routed13": ("precision_proj.", "precision_gate."),
 }
 
 # routed7 (extended) and routed8 target ~600,000 steps rather than the usual 150,000. At
@@ -177,7 +205,10 @@ DATA_EQUIVALENT_STEPS = 600000
 # shared backbone and code/math/science tables exactly as trained.
 # Values are checkpoint-file PREFIXES (not arm names) - routed10's parent (routed7) trains at
 # large scale, so its checkpoints are named "large_routed7_step*.pt", not "routed7_step*.pt".
-WARM_START_PARENT = {"routed9": "routed", "routed10": "large_routed7"}
+WARM_START_PARENT = {
+    "routed9": "routed", "routed10": "large_routed7",
+    "routed11": "routed8", "routed12": "routed8", "routed13": "routed8",
+}
 COOLDOWN_STEPS = 50000  # ~1/3 of a full run - cheap, and the backbone is already trained
 COOLDOWN_BACKBONE_LR_SCALE = 0.1  # warm-started params (everything but nlp) train 10x slower
                                     # than the freshly-reinitialized nlp branch, so the cooldown
