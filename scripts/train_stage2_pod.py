@@ -12,16 +12,21 @@ Usage (run from the repo root on the pod):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
+import os
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from src.data.build_examples import TokenizerBundle
@@ -71,9 +76,38 @@ NUM_WORKERS = 4
 PREFETCH_FACTOR = 4
 
 
-def _loader(dataset, batch_size: int = None):
+def _ddp_setup() -> tuple[int, int, int, str]:
+    """Returns (rank, world_size, local_rank, device). Reads torchrun's env vars (RANK/
+    WORLD_SIZE/LOCAL_RANK) - the standard env://-based rendezvous, no manual multiprocessing
+    spawn. No-ops (rank=0, world_size=1, device="cuda") when launched with plain `python3`
+    (every launch this project has used before tonight), so this is purely additive - a
+    single-GPU launch is byte-identical to before."""
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size <= 1:
+        return 0, 1, 0, "cuda"
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    return rank, world_size, local_rank, f"cuda:{local_rank}"
+
+
+def _loader(dataset, batch_size: int = None, world_size: int = 1):
+    bs = batch_size or BATCH_SIZE
+    if world_size > 1:
+        # Divide, don't multiply: keeps the TOTAL effective batch (and therefore total steps
+        # to reach the same token target, and the LR schedule computed against total_steps)
+        # identical to the validated single-GPU recipe - DDP only parallelizes the SAME work
+        # across GPUs, it doesn't change what's being trained. Each rank does 1/world_size of
+        # the per-step batch; gradients all-reduce (averaged) across ranks on the sync step.
+        assert bs % world_size == 0, (
+            f"batch_size {bs} must be divisible by world_size {world_size} to keep the "
+            f"effective batch unchanged - pick a batch size that divides cleanly."
+        )
+        bs = bs // world_size
     return DataLoader(
-        dataset, batch_size=batch_size or BATCH_SIZE, num_workers=NUM_WORKERS,
+        dataset, batch_size=bs, num_workers=NUM_WORKERS,
         pin_memory=True,
         prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
         persistent_workers=NUM_WORKERS > 0,
@@ -327,8 +361,12 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
 
 
 def calibrate(arm: str, steps: int, scale: str = "base") -> float:
-    device = "cuda"
-    print(f"CUDA available: {torch.cuda.is_available()}  device: {torch.cuda.get_device_name(0)}", flush=True)
+    rank, world_size, local_rank, device = _ddp_setup()
+    is_main = rank == 0
+    _ld = partial(_loader, world_size=world_size)
+    if is_main:
+        print(f"CUDA available: {torch.cuda.is_available()}  device: {torch.cuda.get_device_name(local_rank)}"
+              f"  world_size: {world_size}", flush=True)
     if arm in ("routed7", "routed10") + LARGE_BET_ARMS:
         scale = "large"  # always large-scale, regardless of what --scale was passed
     if arm in OWT_TOKENIZER_ARMS:
@@ -341,25 +379,31 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
     bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR, nlp_tokenizer_dir=nlp_tok_dir)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     model = _build_model(arm, bundle, device, scale)
-    print(f"{arm} ({scale}) params: {model.num_params():,}", flush=True)
+    if is_main:
+        print(f"{arm} ({scale}) params: {model.num_params():,}", flush=True)
+    if world_size > 1:
+        # DDP.__getattr__ does NOT forward arbitrary custom methods like num_params() to the
+        # wrapped module the way it forwards forward() itself - only reference the DDP object
+        # for the forward/backward pass from here on, never for model-specific attributes.
+        model = DDP(model, device_ids=[local_rank])
 
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
     if arm in ("mot", "hybrid"):
         domains = list(bundle.domain_vocab_sizes)
         loaders = {
-            d: iter(_loader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+            d: iter(_ld(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
     if arm in ("routed9", "routed10"):
-        loader = iter(_loader(PackedRoutedStream(
+        loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
     elif arm in DIET_ARMS:
         # routed17: nlp upweighted to ~70%, no filter. routed18: same upweighting, PLUS only
         # copy-structured documents (see _is_copy_structured in stage2_routed_stream.py).
-        loader = iter(_loader(PackedRoutedStream(
+        loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
             force_domain_filter=(COPY_MINE_MIN_WORD_LEN, COPY_MINE_MIN_GAP) if arm == "routed18" else None,
@@ -372,31 +416,31 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
         # not hypothetical. force_domain guarantees nlp's PRESENCE every batch (default
         # snippet_words, no upweighting - unlike routed17/18, routed16 isn't a mixture-share
         # bet, it just needs the copy-gate mechanism to always have something to learn from).
-        loader = iter(_loader(PackedRoutedStream(
+        loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"], force_domain="nlp",
         ), batch_size=BATCH_SIZE))
     elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
-        loader = iter(_loader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_ld(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
-        loader = iter(_loader(PackedRoutedStream(
+        loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             min_domains=ROUTED3_MIN_DOMAINS, max_domains=ROUTED3_MAX_DOMAINS,
             snippet_words=ROUTED3_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
     elif arm == "routed19":
-        phase1_loader = iter(_loader(PackedRoutedStream(
+        phase1_loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             min_domains=1, max_domains=1, snippet_words=ROUTED19_PHASE1_SNIPPET_WORDS,
         ), batch_size=ROUTED19_BATCH_SIZE))
-        phase2_loader = iter(_loader(PackedRoutedStream(
+        phase2_loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
         ), batch_size=ROUTED19_BATCH_SIZE))
         routed19_phase1_steps = round(steps * ROUTED19_PHASE1_FRACTION)
     elif arm in ("routed4", "routed6"):  # both use 2x context
-        loader = iter(_loader(PackedRoutedStream(bundle, domain_index, LONGCTX_MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_ld(PackedRoutedStream(bundle, domain_index, LONGCTX_MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm not in ("mot",):
         encode_fn = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
-        loader = iter(_loader(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_ld(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
 
     t0 = time.time()
     for step in range(1, steps + 1):
@@ -453,15 +497,30 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
 
     elapsed = time.time() - t0
     sec_per_step = elapsed / steps
-    print(f"\nCALIBRATION RESULT: {sec_per_step:.3f} sec/step on {torch.cuda.get_device_name(0)}", flush=True)
+    if is_main:
+        print(f"\nCALIBRATION RESULT: {sec_per_step:.3f} sec/step/rank on "
+              f"{torch.cuda.get_device_name(local_rank)}  world_size={world_size}  "
+              f"(~{sec_per_step / world_size:.3f} effective sec/step across all ranks)", flush=True)
     return sec_per_step
 
 
 def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
-    device = "cuda"
+    rank, world_size, local_rank, device = _ddp_setup()
+    is_main = rank == 0
+    _ld = partial(_loader, world_size=world_size)
     total_steps = max_steps or MAX_STEPS
-    print(f"device: {torch.cuda.get_device_name(0)}  arm: {arm}  steps: {total_steps}", flush=True)
-    print(f"ARM: {arm}  =  {ARM_LABELS.get(arm, arm)}", flush=True)
+    # routed19 uses its OWN grad-accum count (ROUTED19_GRAD_ACCUM_STEPS=2, paired with
+    # ROUTED19_BATCH_SIZE=32) to hold the same effective batch (64) as every other arm's
+    # BATCH_SIZE(4)*GRAD_ACCUM_STEPS(16) - using the global GRAD_ACCUM_STEPS here instead would
+    # silently give routed19 an effective batch of 32*16=512, not 64, and only total_steps/16
+    # real optimizer updates instead of the design's intended total_steps/2 (caught before
+    # launch by checking this against the ROUTED19_TARGET_MICROSTEPS derivation, not by the
+    # code itself - verify again if any other arm ever needs its own batch/accum pair).
+    grad_accum = ROUTED19_GRAD_ACCUM_STEPS if arm == "routed19" else GRAD_ACCUM_STEPS
+    if is_main:
+        print(f"device: {torch.cuda.get_device_name(local_rank)}  world_size: {world_size}  "
+              f"arm: {arm}  steps: {total_steps}", flush=True)
+        print(f"ARM: {arm}  =  {ARM_LABELS.get(arm, arm)}", flush=True)
     if arm in ("routed7", "routed10") + LARGE_BET_ARMS:
         scale = "large"  # always large-scale, regardless of what --scale was passed
     if arm in OWT_TOKENIZER_ARMS:
@@ -474,7 +533,8 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR, nlp_tokenizer_dir=nlp_tok_dir)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     model = _build_model(arm, bundle, device, scale)
-    print(f"{arm} ({scale}) params: {model.num_params():,}", flush=True)
+    if is_main:
+        print(f"{arm} ({scale}) params: {model.num_params():,}", flush=True)
 
     # routed9/routed10 ("cooldown" arms): the nlp branch is reinitialized fresh (see
     # _warm_start_from_parent) while everything else is warm-started, so it needs to catch up
@@ -551,12 +611,14 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             # its most recent restart). Every pod restart (migrations, watchdog auto-restarts)
             # used to erase everything before it.
             resumed_history = ckpt.get("history", [])
-            print(f"resumed from {cand} at step {start_step} "
-                  f"({len(resumed_history)} history entries carried forward)", flush=True)
+            if is_main:
+                print(f"resumed from {cand} at step {start_step} "
+                      f"({len(resumed_history)} history entries carried forward)", flush=True)
             resumed_own = True
             break
         except Exception as e:
-            print(f"checkpoint {cand} failed to load ({type(e).__name__}: {e}); trying older", flush=True)
+            if is_main:
+                print(f"checkpoint {cand} failed to load ({type(e).__name__}: {e}); trying older", flush=True)
             continue
     if not resumed_own:
         warm_started = False
@@ -566,8 +628,20 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         elif arm in WARM_START_PARENT:
             skip = _NLP_PARAM_PREFIXES if arm in ("routed9", "routed10") else ()
             warm_started = _warm_start_from_parent(model, WARM_START_PARENT[arm], device, skip_prefixes=skip)
-        if not warm_started:
+        if not warm_started and is_main:
             print(f"no checkpoint found for {arm} in {CKPT_DIR} - starting from step 1", flush=True)
+
+    # Every requires_grad_(False) / optimizer param-group split above needs to have already
+    # happened - DDP inspects which params need gradient sync at CONSTRUCTION time, so wrapping
+    # first would sync frozen params too (or crash on include-in-optimizer-but-no-grad
+    # mismatches). raw_model stays the reference for anything that isn't the forward/backward
+    # pass itself (state_dict for checkpointing, custom attributes like .domains,
+    # .num_params()) - DDP does NOT forward arbitrary custom attributes to the wrapped module
+    # the way it forwards forward()/.train()/.eval(), so using the DDP object for those would
+    # either crash or silently do the wrong thing.
+    raw_model = model
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank])
 
     def lr_at(step: int) -> float:
         if step < WARMUP_STEPS:
@@ -578,18 +652,18 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     if arm in ("mot", "hybrid"):
         domains = list(bundle.domain_vocab_sizes)
         loaders = {
-            d: iter(_loader(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+            d: iter(_ld(PackedDomainStream(d, bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
             for d in domains
         }
     if arm in ("routed9", "routed10"):
-        loader = iter(_loader(PackedRoutedStream(
+        loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
     elif arm in DIET_ARMS:
         # routed17: nlp upweighted to ~70%, no filter. routed18: same upweighting, PLUS only
         # copy-structured documents (see _is_copy_structured in stage2_routed_stream.py).
-        loader = iter(_loader(PackedRoutedStream(
+        loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
             force_domain_filter=(COPY_MINE_MIN_WORD_LEN, COPY_MINE_MIN_GAP) if arm == "routed18" else None,
@@ -602,33 +676,33 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         # not hypothetical. force_domain guarantees nlp's PRESENCE every batch (default
         # snippet_words, no upweighting - unlike routed17/18, routed16 isn't a mixture-share
         # bet, it just needs the copy-gate mechanism to always have something to learn from).
-        loader = iter(_loader(PackedRoutedStream(
+        loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"], force_domain="nlp",
         ), batch_size=BATCH_SIZE))
     elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
-        loader = iter(_loader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_ld(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
-        loader = iter(_loader(PackedRoutedStream(
+        loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             min_domains=ROUTED3_MIN_DOMAINS, max_domains=ROUTED3_MAX_DOMAINS,
             snippet_words=ROUTED3_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
     elif arm == "routed19":
-        phase1_loader = iter(_loader(PackedRoutedStream(
+        phase1_loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             min_domains=1, max_domains=1, snippet_words=ROUTED19_PHASE1_SNIPPET_WORDS,
         ), batch_size=ROUTED19_BATCH_SIZE))
-        phase2_loader = iter(_loader(PackedRoutedStream(
+        phase2_loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
         ), batch_size=ROUTED19_BATCH_SIZE))
         routed19_phase1_steps = round(total_steps * ROUTED19_PHASE1_FRACTION)
         print(f"routed19 curriculum: phase 1 (single-domain) steps 1-{routed19_phase1_steps}, "
               f"phase 2 (switching) steps {routed19_phase1_steps + 1}-{total_steps}", flush=True)
     elif arm in ("routed4", "routed6"):  # both use 2x context
-        loader = iter(_loader(PackedRoutedStream(bundle, domain_index, LONGCTX_MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_ld(PackedRoutedStream(bundle, domain_index, LONGCTX_MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm not in ("mot",):
         encode_fn = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
-        loader = iter(_loader(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_ld(PackedMixedStream(encode_fn, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
 
     controller = None
     if arm in ("pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4"):
@@ -665,7 +739,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                                          DIET_PHASE2_NLP_SNIPPET_WORDS if diet_upweighted else None),
             force_domain_filter=(COPY_MINE_MIN_WORD_LEN, COPY_MINE_MIN_GAP) if arm == "routed18" else None,
         )
-        val_iter = iter(_loader(val_stream, batch_size=ROUTED19_BATCH_SIZE if arm == "routed19" else BATCH_SIZE))
+        val_iter = iter(_ld(val_stream, batch_size=ROUTED19_BATCH_SIZE if arm == "routed19" else BATCH_SIZE))
 
     def _held_out_ce():
         model.eval()
@@ -676,7 +750,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                 tok, dom, ctrl, typ, tgt = (t.to(device) for t in (tok, dom, ctrl, typ, tgt))
                 with torch.autocast("cuda"):
                     out = model(tok, dom, ctrl, targets=None, type_ids=typ)
-                for d in model.domains:
+                for d in raw_model.domains:
                     if d not in out:
                         continue
                     mask, logits = out[d]
@@ -772,8 +846,14 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                       f"guard tripped)  {controller.state()}", flush=True)
             continue
 
+        # DDP all-reduces gradients on every .backward() by default - correct but wasteful
+        # during grad-accumulation micro-steps, since only the LAST one before opt.step()
+        # actually needs synced gradients. no_sync() defers that all-reduce to the sync step.
+        is_sync_step = (step % grad_accum == 0)
+        sync_ctx = model.no_sync() if (world_size > 1 and not is_sync_step) else contextlib.nullcontext()
         try:
-            scaler.scale(loss / GRAD_ACCUM_STEPS).backward()
+            with sync_ctx:
+                scaler.scale(loss / grad_accum).backward()
         except RuntimeError as e:
             # Belt-and-braces for FROZEN_BACKBONE_ARMS: the upstream domain-presence guard
             # (above) reduces how often a batch's loss ends up disconnected from every
@@ -790,7 +870,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             continue
         running += loss_val
         running_n += 1
-        if step % GRAD_ACCUM_STEPS == 0:
+        if is_sync_step:
             scaler.step(opt)
             scaler.update()
             opt.zero_grad()
@@ -798,12 +878,15 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         if controller is not None:
             controller.observe(controller_loss_val)
 
-        if val_iter is not None and (step % EVAL_EVERY == 0 or step == total_steps):
+        # Forward-only (torch.no_grad()) inside _held_out_ce(), never a backward() call, so it
+        # never touches DDP's gradient-sync hooks - safe to run on rank 0 alone without other
+        # ranks needing to participate (no collective op gets triggered, no hang risk).
+        if is_main and val_iter is not None and (step % EVAL_EVERY == 0 or step == total_steps):
             val_ce = _held_out_ce()
             history.append({"step": step, "val_ce": round(val_ce, 4), "elapsed": round(time.time() - t0)})
             print(f"  >>> held-out val CE @ step {step}: {val_ce:.4f} (over {VAL_BATCHES} val batches)", flush=True)
 
-        if step % LOG_EVERY == 0:
+        if is_main and step % LOG_EVERY == 0:
             avg = running / max(running_n, 1)
             entry = {"step": step, "loss": round(avg, 4), "elapsed": round(time.time() - t0)}
             if controller is not None:
@@ -813,9 +896,12 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             print(f"step {step}/{total_steps}  loss={avg:.4f}  elapsed={time.time()-t0:.0f}s{ctl}", flush=True)
             running, running_n = 0.0, 0
 
-        if step % CHECKPOINT_EVERY == 0 or step == total_steps:
+        if is_main and (step % CHECKPOINT_EVERY == 0 or step == total_steps):
+            # raw_model, not model - model.state_dict() on a DDP-wrapped module prefixes every
+            # key with "module.", which would silently break every eval function (stage2_modal.
+            # py's evaluate()/evaluate_lambada()) that loads a plain (non-DDP) model class.
             path = CKPT_DIR / f"{ckpt_prefix}_step{step}.pt"
-            torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
+            torch.save({"model": raw_model.state_dict(), "opt": opt.state_dict(), "step": step,
                         "domain_vocab_sizes": bundle.domain_vocab_sizes, "history": history}, path)
             print(f"checkpoint saved: {path}", flush=True)
             # prune older checkpoints for this arm - keep only the newest, disk isn't infinite

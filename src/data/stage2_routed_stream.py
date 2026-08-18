@@ -24,7 +24,7 @@ from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.utils.data import IterableDataset, get_worker_info
 
-from src.data.stage2_stream_dataset import TEXT_EXTRACTORS, _cached_doc_stream
+from src.data.stage2_stream_dataset import TEXT_EXTRACTORS, _cached_doc_stream, _shard_id_and_count
 from src.model.stage2_config import DOMAIN_TAG, STREAM_SOURCES
 
 SNIPPET_WORDS = 250
@@ -45,10 +45,10 @@ def _raw_body_stream(domain: str) -> Iterator[str]:
         yield from cached
         return
 
-    # Resolved lazily (inside this generator's body) so it reflects the worker this generator
-    # actually runs in - see the matching comment in stage2_stream_dataset.py's
-    # _raw_doc_stream for why unsharded multi-worker replay would just duplicate documents.
-    worker_info = get_worker_info()
+    # Resolved lazily (inside this generator's body) so it reflects the worker/rank this
+    # generator actually runs in - see the matching comment in stage2_stream_dataset.py's
+    # _raw_doc_stream for why unsharded multi-worker/multi-GPU replay would just duplicate data.
+    shard_id, num_shards = _shard_id_and_count()
     while True:
         cfg = STREAM_SOURCES[domain]
         stream = load_dataset(
@@ -56,8 +56,8 @@ def _raw_body_stream(domain: str) -> Iterator[str]:
             data_files=cfg.get("data_files"), split="train", streaming=True,
             trust_remote_code=True,
         )
-        if worker_info is not None and worker_info.num_workers > 1:
-            stream = split_dataset_by_node(stream, rank=worker_info.id, world_size=worker_info.num_workers)
+        if num_shards > 1:
+            stream = split_dataset_by_node(stream, rank=shard_id, world_size=num_shards)
         extractor = TEXT_EXTRACTORS[domain]
         for row in stream:
             text = extractor(row)

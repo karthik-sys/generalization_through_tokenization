@@ -39,30 +39,69 @@ def _cache_path(domain: str) -> Path:
     return DATA_CACHE_DIR / f"{domain}.jsonl"
 
 
+def _shard_id_and_count() -> tuple[int, int]:
+    """(global_shard_id, global_num_shards), folding BOTH axes a run can be parallel across:
+    DDP rank (multiple GPUs, torchrun) and DataLoader worker (multiple CPU processes per GPU).
+    Without this, a DDP run would only shard by worker id WITHIN each GPU process - every GPU's
+    worker-0 would replay the identical slice of data as every other GPU's worker-0, silently
+    wasting the extra GPUs' unique-data potential (still numerically correct, since duplicate
+    data isn't wrong, just wasted). No-ops (0, 1) outside both DDP and multi-worker contexts."""
+    worker_info = get_worker_info()
+    worker_id = worker_info.id if worker_info is not None else 0
+    num_workers = worker_info.num_workers if worker_info is not None else 1
+    try:
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+    except ImportError:
+        rank, world_size = 0, 1
+    return rank * num_workers + worker_id, world_size * num_workers
+
+
 def _cached_doc_stream(domain: str) -> Iterator[str] | None:
     """Returns a forever-looping iterator over a local JSONL cache if one exists for this
-    domain, else None (caller falls back to the live HF stream). Loads the whole file into
-    memory once per worker process - a full 4-domain cache at routed19's token-budget-sized
-    target is tens of GB, comfortably inside typical pod RAM (hundreds of GB) - then shuffles
-    with a worker-specific seed so multiple DataLoader workers don't all iterate in lockstep
-    and yield identical batches."""
+    domain, else None (caller falls back to the live HF stream).
+
+    Reads lazily (one line at a time via the file iterator), NOT loaded fully into memory -
+    an earlier version materialized the whole file into a Python list per worker process, which
+    OOM-killed a real run: PackedRoutedStream needs all 4 domains simultaneously, so every
+    worker process loads every domain, and with multiple independently-constructed loaders
+    (routed19's phase1/phase2/val streams each build their own worker pool) that's
+    N_loaders * NUM_WORKERS * (sum of all 4 domains' cache sizes) held in memory at once -
+    confirmed live at ~39GB/domain-set this was approaching hundreds of GB. The OS page cache
+    still makes repeated reads of the same file fast (shared across processes, unlike a
+    process-private Python list), so this isn't a speed regression, just a memory-safety one.
+
+    Diversity across workers/ranks: each pass skips a bounded random number of lines before
+    reading (reseeded every pass, seeded by a rank+worker-unique id) rather than a full
+    shuffle - approximate, not a perfect shuffle, but avoids ever materializing the file."""
     path = _cache_path(domain)
     if not path.exists():
         return None
-    with open(path) as f:
-        docs = [json.loads(line)["text"] for line in f if line.strip()]
-    if not docs:
-        return None
-    worker_info = get_worker_info()
-    seed = worker_info.id if worker_info is not None else 0
-    rng = random.Random(seed)
-    rng.shuffle(docs)
+
+    shard_id, _ = _shard_id_and_count()
 
     def _gen():
+        rng = random.Random(shard_id)
         while True:
-            for d in docs:
-                yield d
-            rng.shuffle(docs)  # reshuffle each pass so multi-epoch reuse isn't identical order
+            with open(path) as f:
+                skip = rng.randint(0, 20000)  # bounded - just diversity, not a real shuffle
+                for _ in range(skip):
+                    if next(f, None) is None:
+                        break
+                yielded_any = False
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        text = json.loads(line)["text"]
+                    except json.JSONDecodeError:
+                        continue
+                    yielded_any = True
+                    yield text
+                if not yielded_any and skip == 0:
+                    raise RuntimeError(f"cache file {path} appears empty")
 
     return _gen()
 
@@ -129,19 +168,19 @@ def _raw_doc_stream(domain: str) -> Iterator[str]:
     extractor = TEXT_EXTRACTORS[domain]
     pass_num = 0
     # Resolved lazily (inside this generator's body, not at construction time) so it reflects
-    # the actual worker this generator is running in - DataLoader(num_workers>1) calls
-    # __iter__ once per worker PROCESS, and without sharding every worker would independently
-    # replay the exact same stream from the same starting point (duplicate documents, not more
-    # throughput) rather than each covering a distinct slice of the source.
-    worker_info = get_worker_info()
+    # the actual worker/rank this generator is running in - both DataLoader(num_workers>1)
+    # AND DDP (multiple GPU processes under torchrun) call __iter__ once per process, and
+    # without 2D sharding every one of them would independently replay the exact same stream
+    # from the same starting point (duplicate documents, not more throughput/unique data).
+    shard_id, num_shards = _shard_id_and_count()
     while True:
         stream = load_dataset(
             cfg["path"], name=cfg.get("name"), data_dir=cfg.get("data_dir"),
             revision=cfg.get("revision"), data_files=cfg.get("data_files"),
             split="train", streaming=True,
         )
-        if worker_info is not None and worker_info.num_workers > 1:
-            stream = split_dataset_by_node(stream, rank=worker_info.id, world_size=worker_info.num_workers)
+        if num_shards > 1:
+            stream = split_dataset_by_node(stream, rank=shard_id, world_size=num_shards)
         if pass_num:
             stream = stream.shuffle(seed=pass_num, buffer_size=1000)
             print(f"[stream] {domain}: source exhausted, restarting (pass {pass_num + 1})", flush=True)
