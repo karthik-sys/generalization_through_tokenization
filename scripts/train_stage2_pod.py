@@ -41,13 +41,20 @@ from src.model.mot_routed_precision_model import MoTRoutedPrecisionModel
 from src.model.stage2_config import (
     ADV_LAMBDA_RAMP_STEPS, ARM_LABELS, BACKBONE_ONLY_CFG, BATCH_SIZE, BET_BACKBONE_LR_SCALE,
     BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS, CHECKPOINT_EVERY, CONFIDENCE_WEIGHT, COOLDOWN_BACKBONE_LR_SCALE,
-    FOCAL_GAMMA, GRAD_ACCUM_STEPS, HYBRID_NATURAL_DATA_FRACTION, LOG_EVERY, LONGCTX_MODEL_CFG, LR,
-    MAX_STEPS, MODEL_CFG, NEW_MODULE_MATCH, ROUTED3_MAX_DOMAINS, ROUTED3_MIN_DOMAINS,
-    ROUTED3_SNIPPET_WORDS, SWITCH_WEIGHT, WARM_START_PARENT, WARMUP_STEPS,
+    COPY_MINE_MIN_GAP, COPY_MINE_MIN_WORD_LEN, COPYGATE_V2_BIAS_INIT, DIET_PHASE2_NLP_SNIPPET_WORDS,
+    FOCAL_GAMMA, FROZEN_BACKBONE_ARMS, GRAD_ACCUM_STEPS, HYBRID_NATURAL_DATA_FRACTION, LOG_EVERY,
+    LONGCTX_MODEL_CFG, LR, MAX_STEPS, MODEL_CFG, NEW_MODULE_MATCH, ROUTED3_MAX_DOMAINS,
+    ROUTED3_MIN_DOMAINS, ROUTED3_SNIPPET_WORDS, SWITCH_WEIGHT, WARM_START_PARENT, WARMUP_STEPS,
 )
 
-BET_ARMS = ("routed11", "routed12", "routed13", "routed14")  # copy-gate, deep-experts, precision-head, scaled-up copy-gate
+BET_ARMS = ("routed11", "routed12", "routed13", "routed14", "routed15", "routed16")
+# copy-gate, deep-experts, precision-head, scaled-up copy-gate, control, copy-gate-v2-frozen -
+# all use bare PackedRoutedStream + the NEW_MODULE_MATCH-driven differential-LR path.
 LARGE_BET_ARMS = ("routed14",)  # subset of BET_ARMS that forces scale="large" (see _build_model)
+DIET_ARMS = ("routed17", "routed18")  # round-2 data-lever arms: force_domain="nlp" upweighting,
+# same mechanism as routed9/10 but no reinit (nlp-vs-rest differential LR via WARM_START_PARENT)
+OWT_TOKENIZER_ARMS = ("routed7", "routed8") + BET_ARMS + DIET_ARMS  # everything sourcing nlp from
+# OpenWebText with routed8's own OWT-fit tokenizer (routed9/10 use PG-19 books instead)
 
 TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2")
 # arm in ("routed7", "routed8"): nlp tokenizer retrained on OpenWebText (see
@@ -251,14 +258,18 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
         raise ValueError(f"scale=large supports mot/baseline/routed/routed3/routed7/routed10/routed14, not {arm}")
     if arm == "mot":
         return MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    if arm in ("routed", "routed8", "routed9"):
+    if arm in ("routed", "routed8", "routed9", "routed15", "routed17", "routed18"):
         # routed8/routed9: identical architecture to plain routed - only the nlp data source
         # (OpenWebText or PG-19 books, applied by _apply_openwebtext_nlp_source /
         # _apply_books_nlp_source in calibrate()/train()) and, for routed9, the warm-start +
-        # mixture upweighting, differ.
+        # mixture upweighting, differ. routed15 (control), routed17/18 (diet-phase data levers)
+        # are the same story - no architecture change, only data/LR treatment differs.
         return MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     if arm == "routed11":  # Bet 1: copy gate on the nlp head, warm-started from routed8
         return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    if arm == "routed16":  # Bet 1 v2: same mechanism, conservative gate init (see routed11/14 post-mortem)
+        return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
+                                       gate_bias_init=COPYGATE_V2_BIAS_INIT).to(device)
     if arm == "routed12":  # Bet 2: per-domain LoRA on the top layers, warm-started from routed8
         return MoTRoutedDeepExpertModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     if arm == "routed13":  # Bet 3 (exploratory): precision/margin head, warm-started from routed8
@@ -295,12 +306,12 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
     print(f"CUDA available: {torch.cuda.is_available()}  device: {torch.cuda.get_device_name(0)}", flush=True)
     if arm in ("routed7", "routed10") + LARGE_BET_ARMS:
         scale = "large"  # always large-scale, regardless of what --scale was passed
-    if arm in ("routed7", "routed8") + BET_ARMS:
-        _apply_openwebtext_nlp_source()  # routed11/12/13 reuse routed8's exact nlp source
+    if arm in OWT_TOKENIZER_ARMS:
+        _apply_openwebtext_nlp_source()  # everything reusing routed8's exact nlp source
     if arm in ("routed9", "routed10"):
         _apply_books_nlp_source()
 
-    nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in ("routed7", "routed8") + BET_ARMS else \
+    nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in OWT_TOKENIZER_ARMS else \
         (BOOKS_NLP_TOKENIZER_DIR if arm in ("routed9", "routed10") else None)
     bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR, nlp_tokenizer_dir=nlp_tok_dir)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
@@ -319,6 +330,14 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
         loader = iter(DataLoader(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS,
+        ), batch_size=BATCH_SIZE))
+    elif arm in DIET_ARMS:
+        # routed17: nlp upweighted to ~70%, no filter. routed18: same upweighting, PLUS only
+        # copy-structured documents (see _is_copy_structured in stage2_routed_stream.py).
+        loader = iter(DataLoader(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"],
+            force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
+            force_domain_filter=(COPY_MINE_MIN_WORD_LEN, COPY_MINE_MIN_GAP) if arm == "routed18" else None,
         ), batch_size=BATCH_SIZE))
     elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
@@ -355,7 +374,7 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
-        elif arm in ("routed", "pooled", "pooled2", "routed5", "routed6", "routed7", "routed8", "routed9", "routed10") + BET_ARMS:
+        elif arm in ("routed", "pooled", "pooled2", "routed5", "routed6", "routed7", "routed8", "routed9", "routed10") + BET_ARMS + DIET_ARMS:
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
@@ -394,12 +413,12 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     print(f"ARM: {arm}  =  {ARM_LABELS.get(arm, arm)}", flush=True)
     if arm in ("routed7", "routed10") + LARGE_BET_ARMS:
         scale = "large"  # always large-scale, regardless of what --scale was passed
-    if arm in ("routed7", "routed8") + BET_ARMS:
-        _apply_openwebtext_nlp_source()  # routed11/12/13 reuse routed8's exact nlp source
+    if arm in OWT_TOKENIZER_ARMS:
+        _apply_openwebtext_nlp_source()  # everything reusing routed8's exact nlp source
     if arm in ("routed9", "routed10"):
         _apply_books_nlp_source()
 
-    nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in ("routed7", "routed8") + BET_ARMS else \
+    nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in OWT_TOKENIZER_ARMS else \
         (BOOKS_NLP_TOKENIZER_DIR if arm in ("routed9", "routed10") else None)
     bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR, nlp_tokenizer_dir=nlp_tok_dir)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
@@ -422,14 +441,37 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             {"params": nlp_params, "lr_scale": 1.0},
             {"params": other_params, "lr_scale": COOLDOWN_BACKBONE_LR_SCALE},
         ], lr=LR)
+    elif arm in FROZEN_BACKBONE_ARMS:
+        # routed16 (copy-gate v2): routed11/14's post-mortem found the copy mechanism itself
+        # never hurt, but the shared backbone/vocab head degraded under the joint objective
+        # even at BET_BACKBONE_LR_SCALE (0.3x, not zero) - its gradient flows straight back
+        # through the SAME hidden states the vocab head depends on. Fix: freeze everything
+        # except the new module entirely (requires_grad=False, not just a low LR) so it
+        # genuinely cannot move, then optimize only the trainable (new) params at full LR.
+        match = NEW_MODULE_MATCH[arm]
+        trainable = []
+        for n, p in model.named_parameters():
+            if any(s in n for s in match):
+                trainable.append(p)
+            else:
+                p.requires_grad_(False)
+        opt = torch.optim.AdamW(trainable, lr=LR)
     elif arm in NEW_MODULE_MATCH:
         match = NEW_MODULE_MATCH[arm]
-        new_params = [p for n, p in model.named_parameters() if any(s in n for s in match)]
-        old_params = [p for n, p in model.named_parameters() if not any(s in n for s in match)]
-        opt = torch.optim.AdamW([
-            {"params": new_params, "lr_scale": 1.0},
-            {"params": old_params, "lr_scale": BET_BACKBONE_LR_SCALE},
-        ], lr=LR)
+        if match:
+            new_params = [p for n, p in model.named_parameters() if any(s in n for s in match)]
+            old_params = [p for n, p in model.named_parameters() if not any(s in n for s in match)]
+            opt = torch.optim.AdamW([
+                {"params": new_params, "lr_scale": 1.0},
+                {"params": old_params, "lr_scale": BET_BACKBONE_LR_SCALE},
+            ], lr=LR)
+        else:
+            # routed15 (control): no new module - every param gets the SAME BET_BACKBONE_LR_SCALE
+            # throttle routed11/12/13's non-new-module params got, so this is a genuine matched
+            # control (identical warm-start + LR treatment, minus whatever each bet added).
+            opt = torch.optim.AdamW(model.parameters(), lr=LR)
+            for g in opt.param_groups:
+                g["lr_scale"] = BET_BACKBONE_LR_SCALE
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=LR)
     scaler = torch.amp.GradScaler("cuda")
@@ -493,6 +535,14 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
+    elif arm in DIET_ARMS:
+        # routed17: nlp upweighted to ~70%, no filter. routed18: same upweighting, PLUS only
+        # copy-structured documents (see _is_copy_structured in stage2_routed_stream.py).
+        loader = iter(DataLoader(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"],
+            force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
+            force_domain_filter=(COPY_MINE_MIN_WORD_LEN, COPY_MINE_MIN_GAP) if arm == "routed18" else None,
+        ), batch_size=BATCH_SIZE))
     elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
         loader = iter(DataLoader(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
@@ -527,17 +577,20 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
 
     val_iter = None
     if arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4", "routed5",
-               "routed6", "routed7", "routed8", "routed9", "routed10") + BET_ARMS:
+               "routed6", "routed7", "routed8", "routed9", "routed10") + BET_ARMS + DIET_ARMS:
         rs3 = arm == "routed3"
-        upweighted = arm in ("routed9", "routed10")
+        books_upweighted = arm in ("routed9", "routed10")
+        diet_upweighted = arm in DIET_ARMS
         seq_len = LONGCTX_MODEL_CFG["max_seq_len"] if arm in ("routed4", "routed6") else MODEL_CFG["max_seq_len"]
         val_stream = PackedRoutedStream(
             bundle, domain_index, seq_len, seed=VAL_SEED,
             min_domains=ROUTED3_MIN_DOMAINS if rs3 else 2,
             max_domains=ROUTED3_MAX_DOMAINS if rs3 else 4,
             snippet_words=ROUTED3_SNIPPET_WORDS if rs3 else 250,
-            force_domain="nlp" if upweighted else None,
-            force_domain_snippet_words=BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS if upweighted else None,
+            force_domain="nlp" if (books_upweighted or diet_upweighted) else None,
+            force_domain_snippet_words=(BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS if books_upweighted else
+                                         DIET_PHASE2_NLP_SNIPPET_WORDS if diet_upweighted else None),
+            force_domain_filter=(COPY_MINE_MIN_WORD_LEN, COPY_MINE_MIN_GAP) if arm == "routed18" else None,
         )
         val_iter = iter(DataLoader(val_stream, batch_size=BATCH_SIZE))
 
@@ -578,7 +631,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             with torch.autocast("cuda"):
                 logits = model(domain, inp, types[:, :-1])
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
-        elif arm in ("routed", "routed7", "routed8", "routed9", "routed10") + BET_ARMS:
+        elif arm in ("routed", "routed7", "routed8", "routed9", "routed10") + BET_ARMS + DIET_ARMS:
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
@@ -675,7 +728,7 @@ if __name__ == "__main__":
                          choices=["mot", "baseline", "sota", "routed", "pooled", "hybrid", "pooled2",
                                   "routed2", "routed3", "routed4", "routed5", "routed6", "routed7",
                                   "routed8", "routed9", "routed10", "routed11", "routed12", "routed13",
-                                  "routed14"])
+                                  "routed14", "routed15", "routed16", "routed17", "routed18"])
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--scale", choices=["base", "large"], default="base",
                          help="'large' (mot/baseline only) uses LARGE_MODEL_CFG for the scale test")

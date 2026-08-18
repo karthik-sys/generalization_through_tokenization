@@ -35,12 +35,18 @@ from src.model.mot_routed_model import MoTRoutedModel
 
 
 class MoTRoutedCopyGateModel(MoTRoutedModel):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, gate_bias_init: float = 0.0, **kwargs):
         super().__init__(*args, **kwargs)
         d_model = self.control_embedding.embedding_dim
         self.copy_q = nn.Linear(d_model, d_model)
         self.copy_k = nn.Linear(d_model, d_model)
         self.copy_gate = nn.Linear(d_model, 1)
+        if gate_bias_init != 0.0:
+            # routed16 ("v2"): routed11/14 left this at PyTorch's default near-zero init, so
+            # sigmoid(bias)~=0.5 - the gate started as an unbiased 50/50 coin flip rather than a
+            # conservative default. A negative init means the gate only turns on where the
+            # learned copy score actually justifies it, not by default everywhere.
+            nn.init.constant_(self.copy_gate.bias, gate_bias_init)
 
     def forward(
         self, token_ids: torch.Tensor, domain_ids: torch.Tensor, is_control: torch.Tensor,

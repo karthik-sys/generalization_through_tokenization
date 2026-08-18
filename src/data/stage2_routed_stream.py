@@ -57,10 +57,52 @@ def _snippet(text: str, max_words: int) -> str:
     return " ".join(text.split()[:max_words])
 
 
+# arm routed18 only: cheap heuristic proxy for "has LAMBADA-shaped structure" - not a
+# linguistic parse, a fast word-recurrence check applied while streaming.
+_STOPWORDS_FOR_MINING = frozenset("""
+    the a an and or but if of to in on at by for with as is was were are be been being
+    it its this that these those he she they we you i his her their our your my him
+    them us me not no so up out about into over after before than then there here what
+    which who when where how all any each other some such only own same too very just
+    also one would could should will shall can may might must do does did have has had
+    from
+""".split())
+
+
+def _is_copy_structured(text: str, min_word_len: int, min_gap: int) -> bool:
+    """A document qualifies if some real content word (not a stopword, >= min_word_len
+    chars) appears at least twice with >= min_gap words between the first and a later
+    occurrence - i.e., a reader could plausibly retrieve the second occurrence from having
+    seen the first, the same skill LAMBADA tests. Word-level, case/punctuation-insensitive."""
+    words = re.findall(r"[A-Za-z']+", text.lower())
+    if len(words) < min_gap + 2:
+        return False
+    first_seen: dict[str, int] = {}
+    for i, w in enumerate(words):
+        if len(w) < min_word_len or w in _STOPWORDS_FOR_MINING:
+            continue
+        if w in first_seen:
+            if i - first_seen[w] >= min_gap:
+                return True
+        else:
+            first_seen[w] = i
+    return False
+
+
+def _filtered_body_stream(domain: str, min_word_len: int, min_gap: int) -> Iterator[str]:
+    """Like _raw_body_stream, but only yields documents passing _is_copy_structured -
+    skips (not discards forever) documents that don't qualify, cycling the underlying
+    source the same way _raw_body_stream does."""
+    for text in _raw_body_stream(domain):
+        if _is_copy_structured(text, min_word_len, min_gap):
+            yield text
+
+
 def synthetic_multidomain_doc_stream(
     seed: int = 0, min_domains: int = MIN_DOMAINS_PER_DOC, max_domains: int = MAX_DOMAINS_PER_DOC,
     snippet_words: int = SNIPPET_WORDS, force_domain: str | None = None,
     force_domain_snippet_words: int | None = None,
+    force_domain_filter: tuple[int, int] | None = None,
 ) -> Iterator[str]:
     """Yields doc strings shaped like build_multidomain_docs.py's output, built live.
 
@@ -69,17 +111,25 @@ def synthetic_multidomain_doc_stream(
     doc, shorter snippets so more switches fit in a fixed 1024-token window - without a
     separate stream implementation. Defaults match the original routed/hybrid/routed2 shape.
 
-    force_domain/force_domain_snippet_words (arms routed9/routed10): guarantees force_domain
-    appears in EVERY doc (rather than the usual rng.sample() chance of being left out) and
-    gives it its own, typically longer, snippet length - the mechanism for upweighting nlp's
-    share of the token mixture well above its default ~1/4 without touching the other 3
-    domains at all. With force_domain_snippet_words=600 (vs the other domains' default 250)
-    and min/max_domains left at 2/4, nlp lands at roughly 600/(600 + 2*250) ~= 55% of tokens
-    in expectation (E[additional domains] = E[k]-1 = 2 at k~Uniform{2,3,4}).
+    force_domain/force_domain_snippet_words (arms routed9/routed10/routed17): guarantees
+    force_domain appears in EVERY doc (rather than the usual rng.sample() chance of being
+    left out) and gives it its own, typically longer, snippet length - the mechanism for
+    upweighting nlp's share of the token mixture well above its default ~1/4 without touching
+    the other 3 domains at all. With force_domain_snippet_words=600 (vs the other domains'
+    default 250) and min/max_domains left at 2/4, nlp lands at roughly 600/(600 + 2*250) ~=
+    55% of tokens in expectation (E[additional domains] = E[k]-1 = 2 at k~Uniform{2,3,4});
+    at 1200 words it's ~70% (routed17).
+
+    force_domain_filter=(min_word_len, min_gap) (arm routed18 only): additionally restricts
+    force_domain's source to documents passing _is_copy_structured - only documents with
+    LAMBADA-shaped internal recurrence get used at all for that domain.
     """
     rng = random.Random(seed)
     domains = list(STREAM_SOURCES)
     body_streams = {d: _raw_body_stream(d) for d in domains}
+    if force_domain and force_domain_filter is not None:
+        min_word_len, min_gap = force_domain_filter
+        body_streams[force_domain] = _filtered_body_stream(force_domain, min_word_len, min_gap)
     other_domains = [d for d in domains if d != force_domain] if force_domain else domains
     while True:
         if force_domain:
@@ -104,6 +154,7 @@ class PackedRoutedStream(IterableDataset):
         min_domains: int = MIN_DOMAINS_PER_DOC, max_domains: int = MAX_DOMAINS_PER_DOC,
         snippet_words: int = SNIPPET_WORDS, force_domain: str | None = None,
         force_domain_snippet_words: int | None = None,
+        force_domain_filter: tuple[int, int] | None = None,
     ):
         self.bundle = bundle
         self.domain_index = domain_index
@@ -115,12 +166,13 @@ class PackedRoutedStream(IterableDataset):
         self.snippet_words = snippet_words
         self.force_domain = force_domain
         self.force_domain_snippet_words = force_domain_snippet_words
+        self.force_domain_filter = force_domain_filter
 
     def __iter__(self):
         buf_tok, buf_dom, buf_ctrl, buf_typ = [], [], [], []
         doc_stream = synthetic_multidomain_doc_stream(
             self.seed, self.min_domains, self.max_domains, self.snippet_words,
-            self.force_domain, self.force_domain_snippet_words)
+            self.force_domain, self.force_domain_snippet_words, self.force_domain_filter)
         for doc in doc_stream:
             for domain, text in _split_spans(doc):
                 if domain not in self.domain_index:

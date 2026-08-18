@@ -171,7 +171,61 @@ ARM_LABELS = {
                "steps routed8 needed to reach the same starting point) rather than routed8 itself "
                "(89M - wrong param count to warm-start a 190M model from). Tests whether scale "
                "and the data/volume lever compound, now that both individually helped.",
+    "routed15": "Round-2 Recipe 1 (control): routed8 + 100k more steps, NO new module, same "
+               "mixture - exact same warm-start + 0.3x backbone LR treatment routed11/12/13 got, "
+               "minus whatever each of them added. Settles whether routed12/13's small gains were "
+               "real mechanism wins or just continued training.",
+    "routed16": "Round-2 Recipe 2: copy-gate v2, backbone genuinely frozen (not just throttled) - "
+               "routed11/14's post-mortem found the copy MECHANISM never hurt (0/60 real "
+               "regressions) but the underlying vocab head collapsed under joint training, even "
+               "at 0.3x LR. This freezes everything except copy_q/copy_k/copy_gate entirely, plus "
+               "a conservative (very negative) gate-bias init, to isolate the mechanism cleanly.",
+    "routed17": "Round-2 Recipe 3: nlp-heavy diet phase, NO reinit - continues routed8 with nlp "
+               "upweighted to ~70% of the mixture (vs the standard ~25%), full tables intact "
+               "(unlike routed9/10's reinit), nlp at full LR / everything else at "
+               "COOLDOWN_BACKBONE_LR_SCALE. Pure data-distribution lever - the one thing "
+               "confirmed to work twice already (source-match, volume) - deliberately NOT another "
+               "architecture bet.",
+    "routed18": "Round-2 Recipe 4: copy-structure data mining - upweights nlp documents whose own "
+               "structure matches LAMBADA's construction (a content word recurs verbatim later in "
+               "the same document), via a stream-level filter, not a new loss/module. Attacks the "
+               "same 82.8%-copy-failure error class as Bet 1, but through data instead of "
+               "architecture - lower risk given what happened to routed11/14.",
 }
+
+# --- Round 2 (routed15-18): informed by routed11-14's post-mortem ---------------------------
+# routed15 reuses BET_BACKBONE_LR_SCALE with an EMPTY NEW_MODULE_MATCH entry (see
+# train_stage2_pod.py's optimizer construction) - same 0.3x-everything treatment routed11/12/13's
+# non-new-module params got, just with nothing new added, so it's a genuine matched control.
+ROUND2_STEPS = 100000
+
+# routed16 only: routed11/14's forensics (see conversation/commit history around their eval)
+# showed the copy MECHANISM itself never hurt (0/60 real regressions on a real LAMBADA check),
+# but the underlying vocab head's accuracy collapsed under the joint objective even at 0.3x LR -
+# gradient from the copy pathway flows straight back through the SAME shared hidden states the
+# vocab head depends on, unlike routed12's LoRA (whose adapter gradient doesn't touch the base
+# weights directly). Fix: freeze everything except the new copy-gate params entirely (not just
+# throttle), and start the gate conservative (very negative bias -> near-0 sigmoid at init,
+# rather than routed11/14's bias~0 -> ~0.5 default) so it only turns on where genuinely useful.
+FROZEN_BACKBONE_ARMS = ("routed16",)
+COPYGATE_V2_BIAS_INIT = -4.0
+
+# routed17 only: nlp mixture share target. force_domain_snippet_words this large (vs
+# BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS=600 for routed9/10's ~55%) pushes nlp toward ~70%:
+# 1200 / (1200 + 2*250) ~= 0.706 (E[other domains]=2, same arithmetic as
+# stage2_routed_stream.py's docstring). No reinit here (unlike routed9/10) since routed17 reuses
+# routed8's own OWT-fit tokenizer - the mixture-share lever is being tested in isolation this
+# time, not confounded with a tokenizer swap.
+DIET_PHASE2_NLP_SNIPPET_WORDS = 1200
+
+# routed18 only: minimum word length + minimum token-gap for the copy-structure document filter
+# (see _is_copy_structured in stage2_routed_stream.py) - a document qualifies if some real content
+# word (not a stopword, length >= COPY_MINE_MIN_WORD_LEN) appears at least twice with at least
+# COPY_MINE_MIN_GAP words between the first and a later occurrence. Loose on purpose: this is a
+# cheap proxy for "has LAMBADA-shaped structure", not a precise match - too strict and the filter
+# starves the stream (most documents get rejected, training stalls waiting on OpenWebText).
+COPY_MINE_MIN_WORD_LEN = 5
+COPY_MINE_MIN_GAP = 15
 
 # routed11/12/13 ("bet" arms, all warm-started from routed8@575k, no reinit - same OWT
 # tokenizer throughout, unlike routed9/10's tokenizer swap). Each adds ONE new small module;
@@ -188,6 +242,8 @@ NEW_MODULE_MATCH = {
     "routed12": ("lora_a.", "lora_b."),
     "routed13": ("precision_proj.", "precision_gate."),
     "routed14": ("copy_q.", "copy_k.", "copy_gate."),  # same mechanism as routed11, at large scale
+    "routed15": (),  # control - no new module, ALL params at BET_BACKBONE_LR_SCALE
+    "routed16": ("copy_q.", "copy_k.", "copy_gate."),  # same mechanism, but see FROZEN_BACKBONE_ARMS
 }
 
 # routed7 (extended) and routed8 target ~600,000 steps rather than the usual 150,000. At
@@ -216,6 +272,7 @@ WARM_START_PARENT = {
     "routed9": "routed", "routed10": "large_routed7",
     "routed11": "routed8", "routed12": "routed8", "routed13": "routed8",
     "routed14": "large_routed7",  # NOT routed8 - wrong param count (89M) to warm-start a 190M model from
+    "routed15": "routed8", "routed16": "routed8", "routed17": "routed8", "routed18": "routed8",
 }
 COOLDOWN_STEPS = 50000  # ~1/3 of a full run - cheap, and the backbone is already trained
 COOLDOWN_BACKBONE_LR_SCALE = 0.1  # warm-started params (everything but nlp) train 10x slower
