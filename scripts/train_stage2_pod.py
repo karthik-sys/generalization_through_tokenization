@@ -655,6 +655,14 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
         elif arm in ("routed", "routed7", "routed8", "routed9", "routed10") + BET_ARMS + DIET_ARMS:
             tok, dom, ctrl, typ, tgt = next(loader)
+            if arm in FROZEN_BACKBONE_ARMS and not (dom == domain_index["nlp"]).any():
+                # force_domain guarantees nlp presence per synthetic DOC, but PackedRoutedStream
+                # packs fixed windows from a buffer spanning multiple docs - a window can still
+                # land entirely inside a non-nlp span from a different doc. For a frozen-backbone
+                # arm that means zero path to any trainable tensor; skip rather than crash.
+                if step % LOG_EVERY == 0:
+                    print(f"step {step}/{total_steps}  SKIPPED (no nlp tokens in window)", flush=True)
+                continue
             tok, dom, ctrl, typ, tgt = tok.to(device), dom.to(device), ctrl.to(device), typ.to(device), tgt.to(device)
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
