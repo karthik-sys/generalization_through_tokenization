@@ -57,6 +57,31 @@ This doesn't gate the other launches - they can go out in parallel - but read it
 before deciding which bet's result to trust most, and before deciding whether to extend any
 of them past their default step budget.
 
+**Already run** (routed8@575000, 300 examples, 0 skipped):
+
+| | value |
+|---|---|
+| single_token_coverage | 53.3% (160/300) |
+| correct | 7.0% (21/300) |
+| copy_failure | **82.8%** of wrong answers (231/279) |
+| near_miss | **0.0%** of wrong answers (0/279) |
+| other | 17.2% of wrong answers (48/279) |
+
+This is a decisive, lopsided result, not a close call. **Copy-failure dominates almost
+completely** - the overwhelming majority of routed8's wrong answers are cases where the
+target word already appeared earlier in the passage and the model simply didn't retrieve it
+(real spot-checked examples: "Shane gripped her arm..." -> target "Shane", already named
+twice earlier in the same passage). **near_miss is exactly zero** - not one of the 279 wrong
+answers had the true word sitting in the model's own top-5. That's a real, meaningful signal
+against Bet 3: this diagnostic finds no calibration/synonym-confusion failures at all for the
+precision head to fix, which is the exact error class it targets.
+
+Practical read: **prioritize routed11/routed14 (Bet 1, copy gate) - the data says this is the
+lever.** routed13 (Bet 3, precision head) still has real value as the exploratory arm it was
+always labeled, but go in expecting a negative or null result given zero supporting signal
+here, not a coin flip. routed12 (Bet 2, deep experts) sits in the ambiguous 17.2% "other"
+bucket - plausible, unconfirmed either way.
+
 ## Prerequisite: routed8@575000 checkpoint
 
 All four warm-start from it (routed11/12/13 directly, routed14 from routed7 which is itself
