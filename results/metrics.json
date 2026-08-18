@@ -218,6 +218,42 @@
     "step": 20000,
     "switch_accuracy": 0.2191
   },
+  "routed11@100000": {
+    "arm": "routed11",
+    "lambada_accuracy": 0.014,
+    "lambada_ppl": 25.8,
+    "note": "Bet 1 (copy gate), 100k/100k continued training from routed8@600k. REGRESSED vs parent: EM 1.40% vs routed8s 6.40%, ppl 25.80 vs 19.13 - despite the diagnostic showing 82.8% of routed8s errors were copy-failures. Mechanism verified correct via unit test (real gradient flow) before launch; regression cause not yet diagnosed - candidates: differential-LR destabilization (fresh copy_q/copy_k/gate at full LR vs 0.3x backbone), or the log(p_mix) loss having different optimization dynamics than plain CE. Needs a training-log check (nlp_copy_gate_mean trend, loss curve) before concluding the mechanism itself is wrong.",
+    "params": 89639364,
+    "scale": "base",
+    "step": 100000
+  },
+  "routed12@100000": {
+    "arm": "routed12",
+    "lambada_accuracy": 0.066,
+    "lambada_ppl": 18.99,
+    "note": "Bet 2 (deep experts / per-domain LoRA on top 2 layers), 100k/100k continued training from routed8@600k. Small real improvement: EM 6.60% vs routed8s 6.40%, ppl 18.99 vs 19.13. Diagnostic gave this the ambiguous 17.2% other bucket - modest, unconfirmed-by-theory gain, landed almost identically to routed13.",
+    "params": 89114364,
+    "scale": "base",
+    "step": 100000
+  },
+  "routed13@100000": {
+    "arm": "routed13",
+    "lambada_accuracy": 0.066,
+    "lambada_ppl": 18.94,
+    "note": "Bet 3, exploratory (precision/margin head), 100k/100k continued training from routed8@600k. Small real improvement, nearly identical to routed12: EM 6.60% vs routed8s 6.40%, ppl 18.94 vs 19.13 - despite the diagnostic showing ZERO near-miss errors (the exact class this bet targets). routed12 and routed13 landing at essentially the same numbers (18.99 vs 18.94 ppl) suggests the gain may be from continued training itself, not either bets specific mechanism - worth a plain continued-training control (routed8 + 100k more steps, no new module) to isolate.",
+    "params": 89114364,
+    "scale": "base",
+    "step": 100000
+  },
+  "routed14-large@100000": {
+    "arm": "routed14",
+    "lambada_accuracy": 0.004,
+    "lambada_ppl": 30.12,
+    "note": "Scaled-up copy gate (Bet 1 architecture at 190.5M), 100k/100k continued training from routed7@150k. REGRESSED sharply: EM 0.40%, ppl 30.12 - worse than routed7s own original checkpoint (4.00% EM, 23.92 ppl). Same direction as routed11 - copy gate regresses at BOTH scales, a consistent (if unwelcome) signal that this is a real property of the mechanism/recipe, not a one-off fluke at base scale.",
+    "params": 191006644,
+    "scale": "large",
+    "step": 100000
+  },
   "routed2@150000": {
     "arm": "routed2",
     "bpb_cross": 2.8226,
@@ -312,6 +348,60 @@
     "scale": "large",
     "step": 150000,
     "switch_accuracy": 0.2959
+  },
+  "routed8@198000": {
+    "arm": "routed8",
+    "bpb_cross": 1.2426,
+    "bpb_single": 1.8295,
+    "lambada_accuracy": 0.036,
+    "lambada_ppl": 23.84,
+    "note": "SNAPSHOT, 198k/600k (33%) into the 4x-data-volume run (nlp OWT-sourced, no warm-start, trained from scratch at champion/base scale). Already close to routed7/routed-large's FINAL 150k numbers despite being a smaller (89M vs 190M) model - LAMBADA ppl 23.84 vs routed7's 23.92, exact-match 3.60% vs 4.00%. Suggests the champion architecture, given enough steps and the right nlp source, closes most of the scale gap on its own.",
+    "params": 89114364,
+    "per_domain_bpb": {
+      "code": 1.1436,
+      "math": 2.1145,
+      "nlp": 2.108,
+      "science": 1.9586
+    },
+    "scale": "base",
+    "step": 198000,
+    "switch_accuracy": 0.2697
+  },
+  "routed8@575000": {
+    "arm": "routed8",
+    "bpb_cross": 1.1251,
+    "bpb_single": 2.0906,
+    "lambada_accuracy": 0.062,
+    "lambada_ppl": 19.13,
+    "note": "FINAL-ish, 575k/600k (96%). LAMBADA flatlined vs 496k (ppl 19.25->19.13, EM 6.20%->6.20% exactly) - the volume lever is exhausted at this mixture/recipe. Cross-domain BPB 1.125 is the best in the whole project (prev best routed7 1.214). This is the parent checkpoint for the next phase (copy-gate / deep-experts / precision-head bets).",
+    "params": 89114364,
+    "per_domain_bpb": {
+      "code": 1.2034,
+      "math": 2.3737,
+      "nlp": 2.514,
+      "science": 2.281
+    },
+    "scale": "base",
+    "step": 575000,
+    "switch_accuracy": 0.2775
+  },
+  "routed8@600000": {
+    "arm": "routed8",
+    "bpb_cross": 1.1248,
+    "bpb_single": 2.0922,
+    "lambada_accuracy": 0.064,
+    "lambada_ppl": 19.13,
+    "note": "FINAL, 600k/600k (100% - full target reached). LAMBADA EM ticked up slightly from 575k (6.20%->6.40%), ppl flat (19.13). Cross-domain BPB 1.125, best in the project. This is the final routed8 checkpoint and the parent for all of tonight's routed11-14 continued-training bets.",
+    "params": 89114364,
+    "per_domain_bpb": {
+      "code": 1.2026,
+      "math": 2.3785,
+      "nlp": 2.5141,
+      "science": 2.2833
+    },
+    "scale": "base",
+    "step": 600000,
+    "switch_accuracy": 0.2775
   },
   "routed9@24000": {
     "arm": "routed9",
