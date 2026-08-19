@@ -257,6 +257,10 @@ NEW_MODULE_MATCH = {
     "routed20": ("copy_q.", "copy_k.", "copy_gate."),  # same LR treatment as routed11 - see ALIGN_ARMS
     "routed21": ("copy_q.", "copy_k.", "copy_gate."),  # routed20's no-alignment control
     "routed24": ("copy_q.", "copy_k.", "copy_gate."),  # routed11's exact recipe, rerun fresh - see ALIGN_ARMS
+    "routed25": ("copy_q.", "copy_k.", "copy_gate."),
+    "routed26": ("copy_q.", "copy_k.", "copy_gate."),
+    "routed27": ("copy_q.", "copy_k.", "copy_gate."),
+    "routed28": ("copy_q.", "copy_k.", "copy_gate."),
 }
 
 # routed7 (extended) and routed8 target ~600,000 steps rather than the usual 150,000. At
@@ -292,6 +296,15 @@ WARM_START_PARENT = {
     # have to be picked up from scratch at the same time as the new module). routed22/23
     # deliberately absent - from scratch, no parent at all.
     "routed24": "routed8",  # routed11's EXACT parent - see PER_ARM_BACKBONE_LR_SCALE below
+    "routed25": "routed17", "routed26": "routed17", "routed27": "routed17",  # routed21's parent -
+    # gate+diet stacking is the confirmed winner, all three continue from there.
+    "routed28": "large_routed14",  # NOT large_routed7 - large_routed7 has neither diet nor
+    # gate, so warm-starting from it would force the model to learn BOTH simultaneously at
+    # 190M, exactly the "two new things at once" pattern routed21 avoided (and that routed21's
+    # win over routed11/17 argues against). large_routed14 is already the 190M gate-trained
+    # analog of routed11 (EM 9.49%/ppl 10.58) - routed28 only has to learn diet on top of an
+    # already-gate-adapted parent, mirroring routed21's exact order-of-operations logic with
+    # the two axes swapped (diet added second here, gate added second there).
 }
 COOLDOWN_STEPS = 50000  # ~1/3 of a full run - cheap, and the backbone is already trained
 COOLDOWN_BACKBONE_LR_SCALE = 0.1  # warm-started params (everything but nlp) train 10x slower
@@ -307,7 +320,41 @@ COOLDOWN_BACKBONE_LR_SCALE = 0.1  # warm-started params (everything but nlp) tra
 # backbone-plasticity as the one lever being pushed further, not conflated with diet or
 # alignment (those are routed20/21/23's job). Launch longer than routed11's original
 # BET_STEPS too (150k vs 100k) since routed11 showed no sign of saturating.
-PER_ARM_BACKBONE_LR_SCALE = {"routed24": 1.0}  # overrides BET_BACKBONE_LR_SCALE for this arm only
+PER_ARM_BACKBONE_LR_SCALE = {
+    "routed24": 1.0,
+    "routed25": 1.0, "routed26": 1.0, "routed27": 1.0, "routed28": 1.0,  # all four
+    # combine the two INDEPENDENTLY confirmed winners (diet+gate stacking from routed20/21,
+    # full plasticity from routed24) - see the routed25-28 block below.
+}  # overrides BET_BACKBONE_LR_SCALE for these arms only
+
+# routed25/26/27/28: the second batch, launched the same night after routed20/21's result
+# (gate+diet stacked on routed17, EM 14.75-14.79%) crushed every prior number, and routed24
+# separately confirmed full backbone plasticity is a real (if smaller) additional lever.
+# This batch combines both, plus two clean follow-up questions raised by the first batch's
+# results and the review of them:
+#
+#   routed25: FLAGSHIP - routed21's exact recipe (gate + diet @ DIET_PHASE2_NLP_SNIPPET_WORDS,
+#             warm-started from routed17@100000) + full backbone plasticity (PER_ARM_
+#             BACKBONE_LR_SCALE=1.0 instead of routed21's 0.3x). Run to 300k steps (vs
+#             routed21's 100k) since nothing in the first batch showed saturation.
+#   routed26: identical to routed25 except nlp diet share pushed higher via
+#             ROUTED26_NLP_SNIPPET_WORDS (~83% nlp vs routed25's ~70%) - is 70% actually
+#             the ceiling, or does more help further now that copy-gate is stacked in?
+#   routed27: identical to routed25 except nlp sourced from PG-19 books instead of
+#             OpenWebText (routed9/10's source-match lever - LAMBADA passages are
+#             book-derived, and the long-range antecedent->target copying it tests is a
+#             skill short web pages rarely exercise). Tests whether source-matching stacks
+#             with gate+diet, not a robustness/seed check - a genuinely different hypothesis,
+#             reusing already-proven code (_apply_books_nlp_source).
+#   routed28: the SAME recipe at 190M scale, warm-started from large_routed14 (NOT
+#             large_routed7 - see WARM_START_PARENT's comment for why: large_routed14 is
+#             already the 190M gate-trained analog of routed11, so routed28 only has to learn
+#             diet as the one new thing, mirroring routed21's order-of-operations rather than
+#             confounding diet+gate simultaneously the way a large_routed7 parent would have).
+ROUTED26_NLP_SNIPPET_WORDS = 2400  # vs DIET_PHASE2_NLP_SNIPPET_WORDS=1200 -> ~82.8% nlp share
+                                     # (2400 / (2400 + 2*250), same arithmetic as routed17's own)
+ROUTED25_STEPS = 300000  # routed25/26/27's shared step budget (routed28 stays at BET_STEPS,
+                           # cheaper to keep the large-scale run shorter for a first look)
 
 # routed20/21/22/23: the four-way ablation launched the night evaluate_lambada's copy-gate
 # measurement bug was found and fixed (see mot_routed_copygate_model.py). Two real, newly-
