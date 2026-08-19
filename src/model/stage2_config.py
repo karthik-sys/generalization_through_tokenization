@@ -42,6 +42,27 @@ LARGE_BACKBONE_ONLY_CFG = {k: v for k, v in LARGE_MODEL_CFG.items() if k != "emb
 # (head/embedding shapes are structurally incompatible with every existing checkpoint).
 TIED_MODEL_CFG = dict(emb_dim=128, d_model=512, n_heads=8, ffn_dim=2048, n_layers=23, max_seq_len=1024)
 
+# routed30 (B), routed31 (C), routed32 (D): three more reallocations of the same 89M-ish
+# budget, run alongside routed29, each testing a different lever rather than isolating one:
+#   routed30 (B): vocab-shrink + direct tying. code/math/science are starved under the 70%
+#     nlp diet (~30% of tokens split 3 ways) yet still carry DOMAIN_VOCAB_SIZES' full 24k
+#     vocab each - retrained at 10k (tokenizers_stage2_shrunk, already built), nlp untouched.
+#     emb_dim raised to d_model (512) so tying is DIRECT (no bridge needed, unlike routed29
+#     which deliberately keeps emb_dim small) - simpler but leaves less budget for backbone
+#     depth than routed29's approach, on purpose: this tests the alternative bet (wider,
+#     cleaner tying + fixed starved vocabs) against routed29's (narrow embeddings, max depth).
+#   routed31 (C): routed29's allocation (narrow tied embeddings, max depth) + the aggressive
+#     modern-technique stack - RoPE, RMSNorm, SwiGLU FFN, QK-norm (see backbone_modern.py).
+#     The exploratory bet: do techniques proven elsewhere help THIS specific setup.
+#   routed32 (D): routed29's allocation + only RoPE + RMSNorm (no SwiGLU/QK-norm). The "safe
+#     improver" - the two changes closest to risk-free, meant to actually beat the flagship
+#     rather than test a hypothesis.
+ROUTED30_MODEL_CFG = dict(emb_dim=512, d_model=512, n_heads=8, ffn_dim=2048, n_layers=16, max_seq_len=1024)
+# (16 layers lands at 87.59M with code/math/science@10k+nlp@~36k, emb_dim=d_model=512 -
+# verified by direct construction, not the ~12-14 first guessed before checking real numbers)
+ROUTED30_SHRUNK_VOCAB = 10000  # code/math/science only - nlp stays at its normal size
+ROUTED_MODERN_MODEL_CFG = dict(emb_dim=128, d_model=512, n_heads=8, ffn_dim=2048, n_layers=24, max_seq_len=1024)
+
 # arm="routed6" only: plain MoTRoutedModel at 2x context (1024->2048), nothing else changed -
 # more room between switches for the model to re-establish domain state, without touching
 # loss weighting at all (unlike routed2/3/hybrid, which all failed by that route).

@@ -43,6 +43,7 @@ from src.model.mot_routed_decoupled_model import MoTRoutedDecoupledModel
 from src.model.mot_routed_deepexpert_model import DEFAULT_N_EXPERT_LAYERS, MoTRoutedDeepExpertModel
 from src.model.mot_routed_model import MoTRoutedModel
 from src.model.mot_routed_tied_model import MoTRoutedTiedModel
+from src.model.backbone_modern import ModernBackbone
 from src.model.mot_routed_precision_model import MoTRoutedPrecisionModel
 from src.model.stage2_config import (
     ADV_LAMBDA_RAMP_STEPS, ALIGN_ARMS, ALIGN_LOSS_EVERY, ALIGN_LOSS_WEIGHT, ARM_LABELS,
@@ -71,8 +72,10 @@ DIET_ARMS = ("routed17", "routed18")  # round-2 data-lever arms: force_domain="n
 # model(tok, dom, ctrl, targets=tgt, ...) call); RECIPE_DIET_ARMS is the subset using the
 # diet (nlp-upweighted) loader rather than the plain one.
 RECIPE_ARMS = ("routed20", "routed21", "routed22", "routed23", "routed24",
-                "routed25", "routed26", "routed27", "routed28", "routed29")
-RECIPE_DIET_ARMS = ("routed20", "routed21", "routed25", "routed26", "routed27", "routed28", "routed29")
+                "routed25", "routed26", "routed27", "routed28", "routed29",
+                "routed30", "routed31", "routed32")
+RECIPE_DIET_ARMS = ("routed20", "routed21", "routed25", "routed26", "routed27", "routed28", "routed29",
+                     "routed30", "routed31", "routed32")
 OWT_TOKENIZER_ARMS = ("routed7", "routed8", "routed19") + BET_ARMS + DIET_ARMS + RECIPE_ARMS  # everything
 # sourcing nlp from OpenWebText with routed8's own OWT-fit tokenizer (routed9/10 use PG-19 books instead)
 
@@ -147,6 +150,10 @@ OWT_NLP_TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2_owt" / "nlp")
 # arm in ("routed9", "routed10"): nlp tokenizer retrained on PG-19 books (see
 # scripts/retrain_nlp_tokenizer_books.py).
 BOOKS_NLP_TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2_books" / "nlp")
+# arm routed30 only: code/math/science retrained at ROUTED30_SHRUNK_VOCAB (see
+# stage2_modal.py's train_shrunk_vocab_tokenizers), nlp copied in unchanged from the OWT-fit
+# tokenizer - a complete, self-contained tokenizer dir, no nlp_tokenizer_dir override needed.
+SHRUNK_TOKENIZER_DIR = str(REPO_ROOT / "tokenizers_stage2_shrunk")
 CKPT_DIR = REPO_ROOT / "checkpoints"
 # arms routed9/routed10 only: state_dict key prefixes that are nlp-domain-specific and must
 # be reinitialized (not warm-started) when switching to a differently-fit nlp tokenizer - see
@@ -378,6 +385,30 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
         # checkpoint exists for this architecture (head/embedding shapes differ structurally).
         from src.model.stage2_config import TIED_MODEL_CFG
         return MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **TIED_MODEL_CFG).to(device)
+    if arm == "routed30":
+        # vocab-shrink + direct tying (see ROUTED30_MODEL_CFG in stage2_config.py): code/
+        # math/science retrained at ROUTED30_SHRUNK_VOCAB (10k, vs 24k - they're starved
+        # under the diet mixture anyway), nlp untouched. emb_dim raised to d_model so tying
+        # is direct (no bridge) - simpler than routed29 but leaves less for backbone depth
+        # (16 layers here vs routed29's 23) - the alternative bet, not a strict upgrade.
+        from src.model.stage2_config import ROUTED30_MODEL_CFG
+        return MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **ROUTED30_MODEL_CFG).to(device)
+    if arm == "routed31":
+        # routed29's allocation (narrow tied embeddings, max depth) + the full modern-
+        # technique stack: RoPE, RMSNorm, SwiGLU FFN, QK-norm (see backbone_modern.py). The
+        # aggressive exploratory bet - do techniques proven elsewhere help here.
+        from src.model.stage2_config import ROUTED_MODERN_MODEL_CFG
+        return MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **ROUTED_MODERN_MODEL_CFG,
+                                   backbone_cls=ModernBackbone,
+                                   backbone_kwargs={"use_swiglu": True, "use_qk_norm": True}).to(device)
+    if arm == "routed32":
+        # routed29's allocation + only RoPE + RMSNorm (no SwiGLU/QK-norm) - the "safe
+        # improver", the two changes closest to risk-free, meant to actually beat the
+        # flagship rather than test a hypothesis.
+        from src.model.stage2_config import ROUTED_MODERN_MODEL_CFG
+        return MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **ROUTED_MODERN_MODEL_CFG,
+                                   backbone_cls=ModernBackbone,
+                                   backbone_kwargs={"use_swiglu": False, "use_qk_norm": False}).to(device)
     if arm == "routed16":  # Bet 1 v2: same mechanism, conservative gate init (see routed11/14 post-mortem)
         return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
                                        gate_bias_init=COPYGATE_V2_BIAS_INIT).to(device)
@@ -439,7 +470,8 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
 
     nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in OWT_TOKENIZER_ARMS else \
         (BOOKS_NLP_TOKENIZER_DIR if arm in ("routed9", "routed10") else None)
-    bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR, nlp_tokenizer_dir=nlp_tok_dir)
+    tok_dir = SHRUNK_TOKENIZER_DIR if arm == "routed30" else TOKENIZER_DIR
+    bundle = TokenizerBundle(tokenizer_dir=tok_dir, nlp_tokenizer_dir=None if arm == "routed30" else nlp_tok_dir)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     model = _build_model(arm, bundle, device, scale)
     if is_main:
@@ -643,7 +675,8 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
 
     nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in OWT_TOKENIZER_ARMS else \
         (BOOKS_NLP_TOKENIZER_DIR if arm in ("routed9", "routed10") else None)
-    bundle = TokenizerBundle(tokenizer_dir=TOKENIZER_DIR, nlp_tokenizer_dir=nlp_tok_dir)
+    tok_dir = SHRUNK_TOKENIZER_DIR if arm == "routed30" else TOKENIZER_DIR
+    bundle = TokenizerBundle(tokenizer_dir=tok_dir, nlp_tokenizer_dir=None if arm == "routed30" else nlp_tok_dir)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     model = _build_model(arm, bundle, device, scale)
     if is_main:
@@ -1100,7 +1133,8 @@ if __name__ == "__main__":
                                   "routed8", "routed9", "routed10", "routed11", "routed12", "routed13",
                                   "routed14", "routed15", "routed16", "routed17", "routed18", "routed19",
                                   "routed20", "routed21", "routed22", "routed23", "routed24",
-                                  "routed25", "routed26", "routed27", "routed28", "routed29"])
+                                  "routed25", "routed26", "routed27", "routed28", "routed29",
+                                  "routed30", "routed31", "routed32"])
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--scale", choices=["base", "large"], default="base",
                          help="'large' (mot/baseline only) uses LARGE_MODEL_CFG for the scale test")

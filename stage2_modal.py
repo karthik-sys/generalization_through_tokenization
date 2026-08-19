@@ -100,6 +100,31 @@ def train_tokenizers():
     volume.commit()
 
 
+@app.function(image=image, volumes={VOLUME_PATH: volume}, timeout=1800)
+def train_shrunk_vocab_tokenizers(vocab_size: int = 10000):
+    """routed-B: code/math/science are starved of tokens under the diet mixture (~70%+ nlp)
+    yet still carry DOMAIN_VOCAB_SIZES' full 24k vocab each - real over-parameterization for
+    how little data actually updates them. Retrains ONLY those three at a smaller vocab_size,
+    reusing the ALREADY-SAMPLED corpus on the volume (no need to re-sample) and writing to a
+    separate output dir so the existing tokenizers_stage2 (used by every other arm) is left
+    untouched. nlp and the baseline/sota tokenizers are deliberately not retrained here."""
+    _setup_paths()
+    import os
+
+    os.chdir("/root/repo")
+    from src.tokenizers.train_all_stage2 import _load_sample_texts
+    from src.tokenizers.bpe_tokenizer import train_bpe
+
+    out_dir = f"{VOLUME_PATH}/tokenizers_stage2_shrunk"
+    sample_dir = f"{VOLUME_PATH}/stage2_tokenizer_sample"
+    for domain in ("code", "math", "science"):
+        texts = _load_sample_texts(domain, sample_dir)
+        print(f"retraining {domain} BPE tokenizer on {len(texts)} sampled docs, vocab={vocab_size}", flush=True)
+        train_bpe(texts, model_prefix=f"{out_dir}/{domain}/model", vocab_size=vocab_size)
+    volume.commit()
+    print("DONE: shrunk code/math/science tokenizers written to tokenizers_stage2_shrunk", flush=True)
+
+
 @app.function(image=image, gpu="T4", volumes={VOLUME_PATH: volume}, timeout=1800,
               secrets=[modal.Secret.from_name("huggingface-token")])
 def calibrate(arm: str = "mot", steps: int = 150):
@@ -1606,6 +1631,8 @@ def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from:
         sample_tokenizers.remote()
     elif step == "train-tokenizers":
         train_tokenizers.remote()
+    elif step == "train-shrunk-tokenizers":
+        train_shrunk_vocab_tokenizers.remote(vocab_size=steps or 10000)
     elif step == "calibrate":
         sec_per_step = calibrate.remote(arm=arm, steps=steps or 150)
         from src.model.stage2_config import MAX_STEPS

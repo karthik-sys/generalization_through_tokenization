@@ -46,6 +46,8 @@ class MoTRoutedTiedModel(nn.Module):
         max_seq_len: int,
         type_conditioned_domains: tuple[str, ...] = ("nlp",),
         gate_bias_init: float = 0.0,
+        backbone_cls: type = Backbone,
+        backbone_kwargs: dict | None = None,
     ):
         super().__init__()
         self.domains = list(domain_vocab_sizes)
@@ -61,7 +63,10 @@ class MoTRoutedTiedModel(nn.Module):
         )
         self.projections = nn.ModuleDict({d: nn.Linear(emb_dim, d_model) for d in domain_vocab_sizes})
         self.control_embedding = nn.Embedding(self.num_domains, d_model)
-        self.backbone = Backbone(d_model, n_heads, ffn_dim, n_layers, max_seq_len)
+        # backbone_cls/backbone_kwargs let routed-D/C swap in ModernBackbone (RoPE+RMSNorm,
+        # optionally SwiGLU+QK-norm - see backbone_modern.py) without duplicating this whole
+        # class. Default (plain Backbone) matches routed29 exactly.
+        self.backbone = backbone_cls(d_model, n_heads, ffn_dim, n_layers, max_seq_len, **(backbone_kwargs or {}))
 
         # tied output path - see module docstring
         self.head_bridges = nn.ModuleDict({d: nn.Linear(d_model, emb_dim) for d in domain_vocab_sizes})
