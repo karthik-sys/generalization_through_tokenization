@@ -101,6 +101,34 @@ def train_tokenizers():
 
 
 @app.function(image=image, volumes={VOLUME_PATH: volume}, timeout=1800)
+def train_generalist_tokenizer(vocab_size: int = 32000):
+    """routed33's 5th "generalist" domain: a statistical anchor trained on a MIX of all four
+    existing domains' already-sampled corpora (dispatch's "mined intersection vocabulary"
+    idea) rather than a new external source - zero new data to fetch. Reuses the exact same
+    sampled texts already on the volume from the original tokenizer run, just pooled instead
+    of kept per-domain, so this vocab reflects genuinely shared/general structure across
+    code+math+science+nlp instead of specializing in any one of them."""
+    _setup_paths()
+    import os
+
+    os.chdir("/root/repo")
+    from src.tokenizers.train_all_stage2 import _load_sample_texts
+    from src.tokenizers.bpe_tokenizer import train_bpe
+
+    out_dir = f"{VOLUME_PATH}/tokenizers_stage2_generalist"
+    sample_dir = f"{VOLUME_PATH}/stage2_tokenizer_sample"
+    pooled = []
+    for domain in ("code", "math", "science", "nlp"):
+        texts = _load_sample_texts(domain, sample_dir)
+        print(f"pooling {len(texts)} sampled docs from {domain}", flush=True)
+        pooled.extend(texts)
+    print(f"training generalist BPE tokenizer on {len(pooled)} pooled docs, vocab={vocab_size}", flush=True)
+    train_bpe(pooled, model_prefix=f"{out_dir}/generalist/model", vocab_size=vocab_size)
+    volume.commit()
+    print("DONE: generalist tokenizer (pooled code+math+science+nlp) written to tokenizers_stage2_generalist", flush=True)
+
+
+@app.function(image=image, volumes={VOLUME_PATH: volume}, timeout=1800)
 def train_shrunk_vocab_tokenizers(vocab_size: int = 10000):
     """routed-B: code/math/science are starved of tokens under the diet mixture (~70%+ nlp)
     yet still carry DOMAIN_VOCAB_SIZES' full 24k vocab each - real over-parameterization for
@@ -1624,6 +1652,327 @@ def generate(arm: str = "mot", checkpoint_step: int = 150000, seed_domain: str =
     return {"arm": arm, "switching": switching}
 
 
+@app.function(image=image, gpu="T4", volumes={VOLUME_PATH: volume}, timeout=900,
+              secrets=[modal.Secret.from_name("huggingface-token")])
+def diagnose_gradient_conflict(arm: str = "routed25", checkpoint_step: int = 283000,
+                                n_batches: int = 30, scale: str = "base"):
+    """Cheap diagnostic (~30 held-out batches, no full eval sweep): does the switch-prediction
+    auxiliary loss fight the main next-token LM loss for capacity in the shared backbone?
+    Real, established technique (gradient-conflict detection, cf. PCGrad/Yu et al. 2020) -
+    split every batch's per-position loss into "predict a real next token" vs "predict a
+    domain switch" (same mask head_loss already uses internally: target id >= domain vocab
+    size), backward each separately, and measure cosine similarity of the resulting gradients
+    on shared BACKBONE params only (heads/embeddings are domain-specific, not shared, so
+    conflict there is meaningless - every domain already has its own). Negative cosine means
+    the two objectives are genuinely pulling backbone weights in opposite directions and
+    gradient surgery (dropping the conflicting component) would likely help; near-zero means
+    independent; positive means reinforcing."""
+    _setup_paths()
+    import os
+
+    os.chdir("/root/repo")
+    import statistics
+
+    import torch
+    import torch.nn.functional as F
+    from datasets import load_dataset
+    from torch.utils.data import DataLoader, IterableDataset
+
+    from src.data.build_examples import TokenizerBundle
+    from src.model.mot_routed_copygate_model import MoTRoutedCopyGateModel
+    from src.model.stage2_config import LARGE_MODEL_CFG, MODEL_CFG, STREAM_SOURCES
+
+    device = "cuda"
+    if arm == "routed28":
+        MODEL_CFG = LARGE_MODEL_CFG
+        scale = "large"
+    elif scale == "large":
+        MODEL_CFG = LARGE_MODEL_CFG
+    STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
+    ckpt_prefix = f"large_{arm}" if scale == "large" else arm
+    SKIP_DOCS = 300_000
+    seq_len = MODEL_CFG["max_seq_len"]
+
+    def held_out_body_stream(domain):
+        from src.data.stage2_stream_dataset import TEXT_EXTRACTORS
+
+        cfg = STREAM_SOURCES[domain]
+        stream = load_dataset(cfg["path"], name=cfg.get("name"), revision=cfg.get("revision"),
+                               data_files=cfg.get("data_files"), split="train", streaming=True,
+                               trust_remote_code=True).skip(SKIP_DOCS)
+        extractor = TEXT_EXTRACTORS[domain]
+        for row in stream:
+            text = extractor(row)
+            if text:
+                yield text
+
+    def held_out_synthetic_multidomain_stream(seed=0):
+        import random
+
+        from src.data.stage2_routed_stream import MAX_DOMAINS_PER_DOC, MIN_DOMAINS_PER_DOC, SNIPPET_WORDS
+        from src.model.stage2_config import DOMAIN_TAG
+
+        rng = random.Random(seed)
+        domains = list(STREAM_SOURCES)
+        body_streams = {d: held_out_body_stream(d) for d in domains}
+        while True:
+            k = rng.randint(MIN_DOMAINS_PER_DOC, MAX_DOMAINS_PER_DOC)
+            chosen = rng.sample(domains, k)
+            parts = []
+            for domain in chosen:
+                text = " ".join(next(body_streams[domain]).split()[:SNIPPET_WORDS])
+                parts.append(f"{DOMAIN_TAG[domain]}\n{text}\n")
+            yield "".join(parts)
+
+    class HeldOutRoutedStream(IterableDataset):
+        def __init__(self, bundle, domain_index, seq_len):
+            self.bundle, self.domain_index, self.seq_len = bundle, domain_index, seq_len
+            self.domains = list(domain_index)
+
+        def __iter__(self):
+            from src.data.stage2_routed_stream import _split_spans
+
+            buf_tok, buf_dom, buf_ctrl, buf_typ = [], [], [], []
+            for doc in held_out_synthetic_multidomain_stream():
+                for domain, text in _split_spans(doc):
+                    if domain not in self.domain_index:
+                        continue
+                    di = self.domain_index[domain]
+                    buf_tok.append(di); buf_dom.append(di); buf_ctrl.append(1); buf_typ.append(0)
+                    ids, types = self.bundle.encode_domain(domain, text, max_len=10**9)
+                    buf_tok.extend(ids.tolist())
+                    buf_dom.extend([di] * len(ids))
+                    buf_ctrl.extend([0] * len(ids))
+                    buf_typ.extend(types.tolist() if types is not None else [0] * len(ids))
+                window = self.seq_len + 1
+                while len(buf_tok) >= window:
+                    c_tok, c_dom, c_ctrl = buf_tok[:window], buf_dom[:window], buf_ctrl[:window]
+                    c_typ = buf_typ[:window]
+                    targets = []
+                    for i in range(self.seq_len):
+                        nxt = i + 1
+                        if c_ctrl[nxt]:
+                            from_domain = self.domains[c_dom[i]]
+                            targets.append(self.bundle.domain_vocab_sizes[from_domain] + c_dom[nxt])
+                        else:
+                            targets.append(c_tok[nxt])
+                    yield (
+                        torch.tensor(c_tok[:self.seq_len], dtype=torch.long),
+                        torch.tensor(c_dom[:self.seq_len], dtype=torch.long),
+                        torch.tensor(c_ctrl[:self.seq_len], dtype=torch.long),
+                        torch.tensor(c_typ[:self.seq_len], dtype=torch.long),
+                        torch.tensor(targets, dtype=torch.long),
+                    )
+                    buf_tok = buf_tok[window:]; buf_dom = buf_dom[window:]
+                    buf_ctrl = buf_ctrl[window:]; buf_typ = buf_typ[window:]
+
+    bundle = TokenizerBundle(
+        tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
+        nlp_tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp",
+    )
+    ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
+    domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
+    model = MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    print(f"loaded {ckpt_prefix} checkpoint at step {ckpt['step']}", flush=True)
+
+    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    loader = iter(DataLoader(HeldOutRoutedStream(bundle, domain_index, seq_len), batch_size=8))
+
+    cosines = []
+    for b in range(n_batches):
+        tok, dom, ctrl, typ, tgt = next(loader)
+        tok, dom, ctrl, typ, tgt = (t.to(device) for t in (tok, dom, ctrl, typ, tgt))
+        x = model.embed_sequence(tok, dom, ctrl, typ)
+        h = model.backbone(x)
+
+        main_losses, switch_losses = [], []
+        for domain in model.domains:
+            mask = dom == model.domain_index[domain]
+            if not mask.any():
+                continue
+            dtgt = tgt[mask]
+            if domain != "nlp":
+                logits = model.heads[domain](h[mask])
+                per_pos = F.cross_entropy(logits, dtgt, reduction="none")
+            else:
+                p_mix = model._nlp_copy_gate_pmix(h, dom, ctrl, tok).clamp_min(1e-9)
+                per_pos = -torch.log(p_mix.gather(1, dtgt.unsqueeze(-1)).squeeze(-1))
+            is_switch = dtgt >= model.domain_vocab_sizes[domain]
+            if (~is_switch).any():
+                main_losses.append(per_pos[~is_switch])
+            if is_switch.any():
+                switch_losses.append(per_pos[is_switch])
+
+        if not main_losses or not switch_losses:
+            continue
+        main_loss = torch.cat(main_losses).mean()
+        switch_loss = torch.cat(switch_losses).mean()
+
+        model.zero_grad(set_to_none=True)
+        main_loss.backward(retain_graph=True)
+        g_main = torch.cat([p.grad.detach().flatten() for p in backbone_params if p.grad is not None]).clone()
+
+        model.zero_grad(set_to_none=True)
+        switch_loss.backward()
+        g_switch = torch.cat([p.grad.detach().flatten() for p in backbone_params if p.grad is not None]).clone()
+
+        cos = F.cosine_similarity(g_main.unsqueeze(0), g_switch.unsqueeze(0)).item()
+        cosines.append(cos)
+        print(f"  batch {b+1}/{n_batches}  main={main_loss.item():.3f}  switch={switch_loss.item():.3f}  "
+              f"cos={cos:.4f}", flush=True)
+
+    mean_cos = statistics.mean(cosines)
+    frac_negative = sum(1 for c in cosines if c < 0) / len(cosines)
+    print(f"\nGRADIENT CONFLICT for {arm} (checkpoint step {ckpt['step']}), {len(cosines)} batches:", flush=True)
+    print(f"  mean cosine(main_grad, switch_grad) on shared backbone: {mean_cos:.4f}", flush=True)
+    print(f"  fraction of batches with negative cosine (real conflict): {frac_negative:.3f}", flush=True)
+    verdict = ("REAL CONFLICT - gradient surgery would likely help" if mean_cos < -0.05 else
+               "MOSTLY INDEPENDENT - no strong conflict" if abs(mean_cos) <= 0.05 else
+               "REINFORCING - switch task is not fighting the LM loss")
+    print(f"  verdict: {verdict}", flush=True)
+    return {"mean_cosine": mean_cos, "frac_negative": frac_negative, "n_batches": len(cosines)}
+
+
+@app.function(image=image, gpu="T4", volumes={VOLUME_PATH: volume}, timeout=900,
+              secrets=[modal.Secret.from_name("huggingface-token")])
+def diagnose_calibration(arm: str = "routed25", checkpoint_step: int = 283000,
+                          n_batches: int = 40, scale: str = "base"):
+    """Cheap diagnostic: is model confidence calibrated? For every predicted token, bucket by
+    the model's own max-softmax confidence and check whether the argmax was actually correct
+    in that bucket. A well-calibrated model's 80%-confidence bucket is ~80% accurate - this is
+    a genuinely different failure mode than "needs more scale," invisible to BPB/ppl/EM alone.
+    Reports Expected Calibration Error (ECE) per domain, held-out, teacher-forced (same
+    single-domain streams evaluate() uses, just with per-token confidence tracked instead of
+    only aggregate loss)."""
+    _setup_paths()
+    import os
+
+    os.chdir("/root/repo")
+    import torch
+    import torch.nn.functional as F
+    from datasets import load_dataset
+    from torch.utils.data import DataLoader, IterableDataset
+
+    from src.data.build_examples import TokenizerBundle
+    from src.model.mot_routed_copygate_model import MoTRoutedCopyGateModel
+    from src.model.stage2_config import LARGE_MODEL_CFG, MODEL_CFG, STREAM_SOURCES
+
+    device = "cuda"
+    if arm == "routed28":
+        MODEL_CFG = LARGE_MODEL_CFG
+        scale = "large"
+    elif scale == "large":
+        MODEL_CFG = LARGE_MODEL_CFG
+    STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
+    ckpt_prefix = f"large_{arm}" if scale == "large" else arm
+    SKIP_DOCS = 300_000
+    seq_len = MODEL_CFG["max_seq_len"]
+    n_bins = 10
+
+    def held_out_doc_stream(domain):
+        from src.data.stage2_stream_dataset import DOC_SEP, TEXT_EXTRACTORS
+        from src.model.stage2_config import DOMAIN_TAG
+
+        cfg = STREAM_SOURCES[domain]
+        stream = load_dataset(cfg["path"], name=cfg.get("name"), revision=cfg.get("revision"),
+                               data_files=cfg.get("data_files"), split="train", streaming=True,
+                               trust_remote_code=True).skip(SKIP_DOCS)
+        extractor = TEXT_EXTRACTORS[domain]
+        tag = DOMAIN_TAG[domain]
+        for row in stream:
+            text = extractor(row)
+            if text:
+                yield f"{tag}\n{text}{DOC_SEP}"
+
+    class HeldOutDomainStream(IterableDataset):
+        def __init__(self, domain, encode_domain_fn, seq_len):
+            self.domain, self.encode_domain_fn, self.seq_len = domain, encode_domain_fn, seq_len
+
+        def __iter__(self):
+            buf_ids, buf_types = [], []
+            has_types = self.domain == "nlp"
+            for text in held_out_doc_stream(self.domain):
+                ids, types = self.encode_domain_fn(self.domain, text, max_len=10**9)
+                buf_ids.extend(ids.tolist())
+                if has_types:
+                    buf_types.extend(types.tolist())
+                while len(buf_ids) >= self.seq_len + 1:
+                    chunk_ids = torch.tensor(buf_ids[: self.seq_len + 1], dtype=torch.long)
+                    chunk_types = (torch.tensor(buf_types[: self.seq_len + 1], dtype=torch.long)
+                                   if has_types else torch.zeros(self.seq_len + 1, dtype=torch.long))
+                    yield chunk_ids, chunk_types
+                    buf_ids = buf_ids[self.seq_len + 1:]
+                    if has_types:
+                        buf_types = buf_types[self.seq_len + 1:]
+
+    bundle = TokenizerBundle(
+        tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
+        nlp_tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp",
+    )
+    ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
+    domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
+    model = MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    print(f"loaded {ckpt_prefix} checkpoint at step {ckpt['step']}", flush=True)
+
+    results = {}
+    per_domain_batches = max(1, n_batches // len(bundle.domain_vocab_sizes))
+    with torch.no_grad():
+        for domain in bundle.domain_vocab_sizes:
+            di = domain_index[domain]
+            loader = iter(DataLoader(HeldOutDomainStream(domain, bundle.encode_domain, seq_len), batch_size=8))
+            bin_correct = [0] * n_bins
+            bin_total = [0] * n_bins
+            bin_conf_sum = [0.0] * n_bins
+            for _ in range(per_domain_batches):
+                ids, types = next(loader)
+                ids, types = ids.to(device), types.to(device)
+                inp, tgt = ids[:, :-1], ids[:, 1:]
+                dom = torch.full_like(inp, di)
+                ctrl = torch.zeros_like(inp)
+                with torch.autocast("cuda"):
+                    x = model.embed_sequence(inp, dom, ctrl, types[:, :-1])
+                    h = model.backbone(x)
+                    if domain != "nlp":
+                        probs = F.softmax(model.heads[domain](h), dim=-1)
+                    else:
+                        p_mix = model._nlp_copy_gate_pmix(h, dom, ctrl, inp)
+                        probs = p_mix.reshape(h.shape[0], h.shape[1], -1)
+                    conf, pred = probs.max(dim=-1)
+                conf_flat, pred_flat, tgt_flat = conf.reshape(-1), pred.reshape(-1), tgt.reshape(-1)
+                correct = pred_flat == tgt_flat
+                bins = (conf_flat.clamp(0, 0.9999) * n_bins).long()
+                for bidx in range(n_bins):
+                    m = bins == bidx
+                    if m.any():
+                        bin_total[bidx] += int(m.sum())
+                        bin_correct[bidx] += int(correct[m].sum())
+                        bin_conf_sum[bidx] += conf_flat[m].sum().item()
+
+            total = sum(bin_total)
+            ece = 0.0
+            print(f"\n{domain} calibration ({total} predictions):", flush=True)
+            for bidx in range(n_bins):
+                if bin_total[bidx] == 0:
+                    continue
+                acc = bin_correct[bidx] / bin_total[bidx]
+                avg_conf = bin_conf_sum[bidx] / bin_total[bidx]
+                gap = abs(avg_conf - acc)
+                ece += (bin_total[bidx] / total) * gap
+                print(f"  conf[{bidx/n_bins:.1f}-{(bidx+1)/n_bins:.1f}]: n={bin_total[bidx]:5d}  "
+                      f"avg_conf={avg_conf:.3f}  acc={acc:.3f}  gap={gap:.3f}", flush=True)
+            print(f"  Expected Calibration Error (ECE): {ece:.4f}", flush=True)
+            results[domain] = ece
+
+    print(f"\nCALIBRATION SUMMARY for {arm} (checkpoint step {ckpt['step']}):", flush=True)
+    for d, e in results.items():
+        print(f"  {d}: ECE={e:.4f}", flush=True)
+    return results
+
+
 @app.local_entrypoint()
 def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from: str = "", noisy: bool = False, scale: str = "base", n_examples: int = 500):
     """steps=0 means "use the default": 150 for calibrate, MAX_STEPS for train."""
@@ -1633,6 +1982,8 @@ def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from:
         train_tokenizers.remote()
     elif step == "train-shrunk-tokenizers":
         train_shrunk_vocab_tokenizers.remote(vocab_size=steps or 10000)
+    elif step == "train-generalist-tokenizer":
+        train_generalist_tokenizer.remote(vocab_size=steps or 32000)
     elif step == "calibrate":
         sec_per_step = calibrate.remote(arm=arm, steps=steps or 150)
         from src.model.stage2_config import MAX_STEPS
@@ -1660,5 +2011,9 @@ def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from:
         generate.remote(arm=arm, checkpoint_step=steps or 150000, seed_domain=resume_from or "science")
     elif step == "diagnose-lambada":
         diagnose_lambada.remote(arm=arm or "routed8", checkpoint_step=steps or 575000)
+    elif step == "diagnose-gradient-conflict":
+        diagnose_gradient_conflict.remote(arm=arm, checkpoint_step=steps or 283000, scale=scale)
+    elif step == "diagnose-calibration":
+        diagnose_calibration.remote(arm=arm, checkpoint_step=steps or 283000, scale=scale)
     else:
         raise ValueError(f"unknown step: {step}")

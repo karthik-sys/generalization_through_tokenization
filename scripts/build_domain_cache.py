@@ -35,8 +35,70 @@ from src.model.stage2_config import STREAM_SOURCES  # noqa: E402
 
 DOMAINS = ("code", "math", "science", "nlp")
 
+# routed33: WebText (GPT-2's actual training corpus) was curated by a >3-karma Reddit-link
+# filter, which selects for long-form, human-written prose and screens out short pages and
+# nav/boilerplate junk almost as a side effect. OpenWebText (our nlp source) replicates
+# WebText's URL list but not that quality signal at read time - every scraped page is kept
+# regardless of length or how much of it is site chrome. This is a cheap proxy for the same
+# selection pressure: length bounds (WebText docs are long-form, ~500-5000 words is a rough
+# proxy for "article", not "nav menu" or "entire book dump") plus a boilerplate-phrase count
+# (repeated site-chrome phrases are a strong tell for scraped-not-authored content).
+BOILERPLATE_PHRASES = (
+    "click here", "subscribe now", "follow us", "all rights reserved", "sign up",
+    "log in", "newsletter", "terms of service", "privacy policy", "cookie",
+)
 
-def build_cache(domain: str, target_bytes: int, source_override: dict | None = None) -> None:
+
+def aggressive_nlp_filter(text: str, min_words: int = 500, max_words: int = 5000) -> bool:
+    words = text.split()
+    n = len(words)
+    if n < min_words or n > max_words:
+        return False
+    lowered = text.lower()
+    return sum(1 for p in BOILERPLATE_PHRASES if p in lowered) < 2
+
+
+def build_generalist_cache(target_bytes: int) -> None:
+    """routed33's 5th domain: no external source of its own - pooled round-robin from the
+    OTHER four domains' already-built local caches (must run this AFTER code/math/science/nlp
+    are built), same pooling the generalist tokenizer itself was trained on. Keeps the
+    generalist's training-time distribution consistent with what its vocab was fit to."""
+    import random
+
+    source_paths = {d: _cache_path(d) for d in ("code", "math", "science", "nlp")}
+    missing = [d for d, p in source_paths.items() if not p.exists()]
+    if missing:
+        raise SystemExit(f"generalist cache needs {missing} built first - run those domains before this one")
+
+    path = _cache_path("generalist")
+    DATA_CACHE_DIR.mkdir(exist_ok=True)
+    readers = {d: open(p) for d, p in source_paths.items()}
+    written_bytes, n_docs = 0, 0
+    t0 = time.time()
+    rng = random.Random(0)
+    domains = list(readers)
+    with open(path, "w") as out:
+        while written_bytes < target_bytes and readers:
+            d = rng.choice(list(readers))
+            line = readers[d].readline()
+            if not line:
+                readers[d].close()
+                del readers[d]
+                continue
+            out.write(line)
+            written_bytes += len(line.encode("utf-8"))
+            n_docs += 1
+            if n_docs % 5000 == 0:
+                print(f"[generalist] {n_docs:,} docs, {written_bytes/1e9:.2f}GB / "
+                      f"{target_bytes/1e9:.2f}GB target, {time.time()-t0:.0f}s elapsed", flush=True)
+    for r in readers.values():
+        r.close()
+    print(f"[generalist] DONE: {n_docs:,} docs, {written_bytes/1e9:.2f}GB written to {path} "
+          f"in {time.time()-t0:.0f}s (pooled from {domains})", flush=True)
+
+
+def build_cache(domain: str, target_bytes: int, source_override: dict | None = None,
+                 nlp_filter: bool = False) -> None:
     cfg = source_override or STREAM_SOURCES[domain]
     extractor = TEXT_EXTRACTORS[domain]
     path = _cache_path(domain)
@@ -44,6 +106,7 @@ def build_cache(domain: str, target_bytes: int, source_override: dict | None = N
 
     written_bytes = 0
     n_docs = 0
+    n_filtered = 0
     t0 = time.time()
     with open(path, "w") as out:
         stream = _load_dataset_with_retry(
@@ -56,6 +119,9 @@ def build_cache(domain: str, target_bytes: int, source_override: dict | None = N
             text = extractor(row)
             if not text:
                 continue
+            if domain == "nlp" and nlp_filter and not aggressive_nlp_filter(text):
+                n_filtered += 1
+                continue
             line = json.dumps({"text": text}) + "\n"
             out.write(line)
             written_bytes += len(line.encode("utf-8"))
@@ -63,20 +129,26 @@ def build_cache(domain: str, target_bytes: int, source_override: dict | None = N
             if n_docs % 5000 == 0:
                 elapsed = time.time() - t0
                 print(f"[{domain}] {n_docs:,} docs, {written_bytes/1e9:.2f}GB / "
-                      f"{target_bytes/1e9:.2f}GB target, {elapsed:.0f}s elapsed", flush=True)
+                      f"{target_bytes/1e9:.2f}GB target, {elapsed:.0f}s elapsed"
+                      + (f", {n_filtered:,} filtered" if nlp_filter else ""), flush=True)
             if written_bytes >= target_bytes:
                 break
     print(f"[{domain}] DONE: {n_docs:,} docs, {written_bytes/1e9:.2f}GB written to {path} "
-          f"in {time.time()-t0:.0f}s", flush=True)
+          f"in {time.time()-t0:.0f}s" + (f" ({n_filtered:,} filtered out)" if nlp_filter else ""),
+          flush=True)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--domain", choices=DOMAINS)
+    p.add_argument("--domain", choices=DOMAINS + ("generalist",))
     p.add_argument("--all", action="store_true")
     p.add_argument("--target-gb", type=float, default=12.0)
     p.add_argument("--source", choices=["owt", "fineweb"], default="owt",
                     help="nlp only: owt (OpenWebText, matches routed8/19) or fineweb (default STREAM_SOURCES)")
+    p.add_argument("--nlp-filter", action="store_true",
+                    help="nlp only: apply aggressive_nlp_filter (length bounds + boilerplate-phrase "
+                         "screen) to mimic WebText's long-form, human-written selection pressure - "
+                         "see routed33's docstring in build_cache")
     args = p.parse_args()
 
     if not args.domain and not args.all:
@@ -84,7 +156,10 @@ if __name__ == "__main__":
 
     domains = list(DOMAINS) if args.all else [args.domain]
     for d in domains:
+        if d == "generalist":
+            build_generalist_cache(int(args.target_gb * 1e9))
+            continue
         override = None
         if d == "nlp" and args.source == "owt":
             override = {"path": "Skylion007/openwebtext", "name": None}
-        build_cache(d, int(args.target_gb * 1e9), source_override=override)
+        build_cache(d, int(args.target_gb * 1e9), source_override=override, nlp_filter=args.nlp_filter)

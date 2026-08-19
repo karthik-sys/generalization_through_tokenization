@@ -516,4 +516,5 @@ DOMAIN_TAG = {
     "math": "<domain:math>",
     "science": "<domain:science>",
     "nlp": "<domain:nlp>",
+    "generalist": "<domain:generalist>",
 }

@@ -189,6 +189,10 @@ TEXT_EXTRACTORS = {
     "math": lambda r: r.get("text"),
     "science": lambda r: (f"{r['title']}\n{r['abstract']}" if r.get("abstract") else None),
     "nlp": lambda r: r.get("text"),
+    # routed33: generalist has no HF source of its own - always read from its local cache
+    # (built by build_generalist_cache, pooled from the other 4 domains). This entry only
+    # exists so a missing-cache fallback doesn't KeyError instead of failing loudly elsewhere.
+    "generalist": lambda r: r.get("text"),
 }
 DOC_SEP = "\n<|endofdoc|>\n"
 

@@ -37,7 +37,8 @@ def load_tagged_docs(path: str) -> list[tuple[str, str]]:
 
 
 class TokenizerBundle:
-    def __init__(self, tokenizer_dir: str = "tokenizers", nlp_tokenizer_dir: str | None = None):
+    def __init__(self, tokenizer_dir: str = "tokenizers", nlp_tokenizer_dir: str | None = None,
+                 generalist_tokenizer_dir: str | None = None):
         """nlp_tokenizer_dir overrides where the nlp tokenizer loads from, independent of
         tokenizer_dir (which still governs code/math/science/baseline/sota). Exists for
         arm="routed7": its nlp domain trains on a different corpus (OpenWebText, not
@@ -45,12 +46,20 @@ class TokenizerBundle:
         keep using the shared, unmodified tokenizers under tokenizer_dir. Without this,
         there'd be no way to mix "most domains from the shared bundle, one domain from a
         separately-trained tokenizer" without either retraining everything or physically
-        duplicating the untouched tokenizer files."""
+        duplicating the untouched tokenizer files.
+
+        generalist_tokenizer_dir: routed33 only. Adds a 5th plain-BPE domain ("generalist")
+        trained on a pooled sample across all four existing domains, rather than special-
+        casing it - encode_domain's `else` branch (self.bpe[domain].encode(...)) already
+        handles any domain that isn't "nlp" identically, so no dispatch changes needed
+        beyond registering it here."""
         self.bpe = {
             "code": BPETokenizer(f"{tokenizer_dir}/code/model.model"),
             "math": BPETokenizer(f"{tokenizer_dir}/math/model.model"),
             "science": BPETokenizer(f"{tokenizer_dir}/science/model.model"),
         }
+        if generalist_tokenizer_dir:
+            self.bpe["generalist"] = BPETokenizer(f"{generalist_tokenizer_dir}/model.model")
         self.nlp = NLPHybridTokenizer(nlp_tokenizer_dir or f"{tokenizer_dir}/nlp")
         self.baseline = BPETokenizer(f"{tokenizer_dir}/baseline_bpe/model.model")
         self.sota = SotaTokenizer("cl100k_base")
@@ -70,6 +79,8 @@ class TokenizerBundle:
             "science": self.bpe["science"].vocab_size,
             "nlp": self.nlp_vocab_size,
         }
+        if generalist_tokenizer_dir:
+            self.domain_vocab_sizes["generalist"] = self.bpe["generalist"].vocab_size
         self.baseline_vocab_size = self.baseline.vocab_size
         self.sota_vocab_size = self.sota.vocab_size
 
