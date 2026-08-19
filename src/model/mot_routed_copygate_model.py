@@ -62,9 +62,28 @@ class MoTRoutedCopyGateModel(MoTRoutedModel):
         switch_weight: float = 1.0, token_ids: torch.Tensor | None = None,
         is_control: torch.Tensor | None = None,
     ):
-        if targets is None or token_ids is None or is_control is None:
-            # inspection/generation path - copy gate isn't wired into it yet, fall back to
-            # the plain vocab head so existing eval/generate code keeps working unmodified.
+        if targets is None:
+            # Inspection/generation path (evaluate_lambada, generate, ...). Previously fell
+            # back to the plain vocab head for EVERY domain here, silently bypassing
+            # copy_q/copy_k/copy_gate entirely - meaning routed11/14/16's actual copy-gate
+            # contribution to LAMBADA (the exact benchmark this mechanism exists for) was
+            # never measured by evaluate_lambada; every recorded LAMBADA number for these
+            # three arms is byte-identical to their pre-copy-gate parent. Fixed: reuse the
+            # base class's per-domain dict for every domain except nlp (unchanged), and
+            # override nlp's entry with the real copy-gate-mixed distribution whenever
+            # token_ids/is_control are available to compute it - same math as the training
+            # loss below (_nlp_copy_gate_pmix), just returned as log-probs standing in for
+            # logits so argmax/cross_entropy on the caller side work unmodified.
+            out = super().head_loss(h, domain_ids, targets, switch_weight)
+            nlp = "nlp"
+            if nlp in out and token_ids is not None and is_control is not None:
+                mask, _plain_logits = out[nlp]
+                p_mix = self._nlp_copy_gate_pmix(h, domain_ids, is_control, token_ids)
+                out[nlp] = (mask, torch.log(p_mix.clamp_min(1e-9)))
+            return out
+        if token_ids is None or is_control is None:
+            # targets given but the extra tensors this mechanism needs aren't - shouldn't
+            # happen from train()/evaluate() (both always pass both), guards any other caller.
             return super().head_loss(h, domain_ids, targets, switch_weight)
 
         nlp = "nlp"
@@ -97,17 +116,26 @@ class MoTRoutedCopyGateModel(MoTRoutedModel):
             per_domain[domain] = loss.item() / max(n, 1)
         return total_loss / max(total_count, 1), per_domain
 
-    def _nlp_copy_gate_losses(
+    def _nlp_copy_gate_pmix(
         self, h: torch.Tensor, domain_ids: torch.Tensor, is_control: torch.Tensor,
-        token_ids: torch.Tensor, targets: torch.Tensor, switch_weight: float,
-    ) -> tuple[torch.Tensor, float]:
+        token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """The copy-gate-mixed output distribution (vocab softmax blended with the copy
+        distribution) for every nlp-domain position, flattened in the same batch-major,
+        then-position-order as h[domain_ids == nlp_index] gives - i.e. the same order
+        head_loss's targets=None branch uses for every other domain's (mask, logits) entry,
+        so a caller can drop this straight in without reordering.
+
+        Split out of what was _nlp_copy_gate_losses's inline per-row loop so BOTH the
+        training loss below and the inspection-mode path in head_loss (evaluate_lambada,
+        generate) compute the identical mixed distribution from one place, rather than the
+        inspection path silently reimplementing (or, as it did before, skipping) this math."""
         nlp = "nlp"
         idx = self.domain_index[nlp]
         vocab_size = self.domain_vocab_sizes[nlp] + self.num_domains
         ctrl = is_control.bool()
         b = h.shape[0]
-        all_losses = []
-        gate_vals = []
+        all_pmix = []
         for bi in range(b):
             query_mask = domain_ids[bi] == idx  # every nlp-head position, content + switch-marker
             query_pos = query_mask.nonzero(as_tuple=True)[0]
@@ -118,7 +146,6 @@ class MoTRoutedCopyGateModel(MoTRoutedModel):
 
             h_q = h[bi, query_pos]
             tok_at_pos = token_ids[bi, query_pos]
-            tgt_row = targets[bi, query_pos]
 
             q = self.copy_q(h_q)
             k = self.copy_k(h_q)
@@ -139,16 +166,31 @@ class MoTRoutedCopyGateModel(MoTRoutedModel):
 
             p_vocab = F.softmax(vocab_logits, dim=-1)
             p_mix = (1 - gate.unsqueeze(-1)) * p_vocab + gate.unsqueeze(-1) * copy_vocab
-            p_mix = p_mix.clamp_min(1e-9)
-            nll = -torch.log(p_mix.gather(1, tgt_row.unsqueeze(-1)).squeeze(-1))
-            if switch_weight != 1.0:
-                is_switch = tgt_row >= self.domain_vocab_sizes[nlp]
-                w = torch.ones_like(nll)
-                w[is_switch] = switch_weight
-                nll = nll * w
-            all_losses.append(nll)
-            gate_vals.append(gate.mean().item())
+            all_pmix.append(p_mix)
 
-        if not all_losses:
+        if not all_pmix:
+            return h.new_zeros(0, vocab_size)
+        return torch.cat(all_pmix, dim=0)
+
+    def _nlp_copy_gate_losses(
+        self, h: torch.Tensor, domain_ids: torch.Tensor, is_control: torch.Tensor,
+        token_ids: torch.Tensor, targets: torch.Tensor, switch_weight: float,
+    ) -> tuple[torch.Tensor, float]:
+        nlp = "nlp"
+        idx = self.domain_index[nlp]
+        mask = domain_ids == idx
+        if not mask.any():
             return h.new_zeros(0), 0.0
-        return torch.cat(all_losses), (sum(gate_vals) / len(gate_vals))
+
+        p_mix = self._nlp_copy_gate_pmix(h, domain_ids, is_control, token_ids).clamp_min(1e-9)
+        tgt = targets[mask]
+        nll = -torch.log(p_mix.gather(1, tgt.unsqueeze(-1)).squeeze(-1))
+        if switch_weight != 1.0:
+            is_switch = tgt >= self.domain_vocab_sizes[nlp]
+            w = torch.ones_like(nll)
+            w[is_switch] = switch_weight
+            nll = nll * w
+
+        with torch.no_grad():
+            gate_mean = torch.sigmoid(self.copy_gate(h[mask]).squeeze(-1)).mean().item()
+        return nll, gate_mean

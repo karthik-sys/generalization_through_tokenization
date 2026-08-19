@@ -220,12 +220,14 @@
   },
   "routed11@100000": {
     "arm": "routed11",
-    "lambada_accuracy": 0.014,
-    "lambada_ppl": 25.8,
-    "note": "Bet 1 (copy gate), 100k/100k continued training from routed8@600k. REGRESSED vs parent: EM 1.40% vs routed8s 6.40%, ppl 25.80 vs 19.13 - despite the diagnostic showing 82.8% of routed8s errors were copy-failures. Mechanism verified correct via unit test (real gradient flow) before launch; regression cause not yet diagnosed - candidates: differential-LR destabilization (fresh copy_q/copy_k/gate at full LR vs 0.3x backbone), or the log(p_mix) loss having different optimization dynamics than plain CE. Needs a training-log check (nlp_copy_gate_mean trend, loss curve) before concluding the mechanism itself is wrong.",
+    "lambada_accuracy": 0.0986,
+    "lambada_ppl": 10.18,
+    "note": "Round 2, Bet 1 (copy-gate v1 - unbiased gate init, PyTorch default near-zero bias, sigmoid(bias)~0.5), 100k/100k continued training from routed8@600000. [Same evaluate_lambada() measurement bug as routed14/16 - see routed16@100000's note for the full mechanism and fix (src/model/mot_routed_copygate_model.py). Never properly scored before this fix; routed16's 'v2 conservative gate init' follow-up was specifically motivated by v1 (this arm) looking unpromising, but that judgment was made entirely on the broken measurement - both were silently falling back to the plain vocab head. Now that it's actually measured: EM 9.86%, ppl 10.18 - the BEST LAMBADA result in the whole project on both metrics, beating routed17's diet recipe (8.85%/20.86) and routed16/v2 (8.77%/11.06, itself also just corrected). The 'conservative init fixes an unpromising gate' premise behind v2 does not hold up - v1's unbiased gate init outperforms v2's -4.0 conservative init once both are actually scored correctly.)",
     "params": 89639364,
     "scale": "base",
-    "step": 100000
+    "step": 100000,
+    "lambada_accuracy_stopword_filtered": 0.1025,
+    "lambada_bits_per_target_token": 3.348
   },
   "routed12@100000": {
     "arm": "routed12",
@@ -276,9 +278,9 @@
     "arm": "routed16",
     "bpb_cross": 1.1248,
     "bpb_single": 2.0922,
-    "lambada_accuracy": 0.0584,
-    "lambada_ppl": 23.63,
-    "note": "Round 2, Recipe 2 (copy-gate v2 - genuinely frozen backbone/vocab head, gate bias init -4.0), 100k/100k continued training from routed8@600000. Still byte-identical to routed8 at full n=5153 (EM 5.84%, ppl 23.63, matching to every decimal) - confirms at full scale the harness-bypass finding already established at n=500: evaluate()/evaluate_lambada() always call MoTRoutedCopyGateModel with targets=None, which falls back entirely to the plain vocab head (mot_routed_copygate_model.py:65-68), so the copy_q/copy_k/copy_gate mechanism has never been scored by the official harness for routed11/14/16 at any sample size. Real assessment still requires the hand-built forward-pass approach from this sessions forensic script, not the standard eval path. [CORRECTED to full LAMBADA test set (n=5153), superseding the earlier n=500 number. Discovery: EleutherAI/lambada_openai is streamed unshuffled, and the first ~500-1000 examples are measurably easier than the full set for every arm tested (routed8/15/16/17/18 all showed the same pattern: EM and ppl both degrade as more examples are scored, stabilizing by ~3000+). Every LAMBADA number this project ever recorded before this correction was measured at n=500 on this same unshuffled stream and is likely optimistic by a similar margin (~0.5pp EM, ~4-5 ppl) - not yet re-verified for arms outside this batch of 5.]",
+    "lambada_accuracy": 0.0877,
+    "lambada_ppl": 11.06,
+    "note": "Round 2, Recipe 2 (copy-gate v2 - genuinely frozen backbone/vocab head, gate bias init -4.0), 100k/100k continued training from routed8@600000. [UPDATED: evaluate_lambada() had a real measurement bug for every copy-gate arm (routed11/14/16) - it always called the model with targets=None, which MoTRoutedCopyGateModel.head_loss silently interpreted as 'inspection path, skip the copy_q/copy_k/copy_gate mechanism entirely and fall back to the plain vocab head' - so every LAMBADA number ever recorded for these three arms was actually just their warm-start parent's number, byte-identical, regardless of what the copy-gate had learned. Fixed in src/model/mot_routed_copygate_model.py: head_loss's targets=None branch now computes the real copy-gate-mixed distribution via a new _nlp_copy_gate_pmix() helper (shared with the training-loss path, so they can't drift apart again) instead of bypassing it. Verified via a standalone numerical test: argmax (and therefore EM) is mathematically unaffected by the fix's minor renormalization difference from the raw training NLL (isolated to the ~2 earliest per-sequence positions with no valid copy source yet - confirmed exactly zero difference everywhere else). Re-scored at full n=5153 with the fix: ppl dropped from the stale 23.63 to 11.06 (more than halved, now the best ppl in the whole project by a wide margin), EM rose from the stale 5.84% to 8.77% (nearly matching routed17's 8.85%, the previous project-best). The old (STALE_bugged) fields are kept for the record, not as current numbers - the copy-gate mechanism was real and working the whole time, it was just never being scored.]",
     "params": 89639364,
     "per_domain_bpb": {
       "code": 1.2026,
@@ -288,7 +290,11 @@
     },
     "scale": "base",
     "step": 100000,
-    "switch_accuracy": 0.2775
+    "switch_accuracy": 0.2775,
+    "lambada_accuracy_STALE_bugged": 0.0584,
+    "lambada_ppl_STALE_bugged": 23.63,
+    "lambada_accuracy_stopword_filtered": 0.0918,
+    "lambada_bits_per_target_token": 3.468
   },
   "routed17@100000": {
     "arm": "routed17",
@@ -325,6 +331,24 @@
     "scale": "base",
     "step": 100000,
     "switch_accuracy": 0.222
+  },
+  "routed19@96000": {
+    "arm": "routed19",
+    "bpb_cross": 1.4021,
+    "bpb_single": 1.3975,
+    "lambada_accuracy": 0.0291,
+    "lambada_ppl": 77.82,
+    "note": "SNAPSHOT, 96k/300k (32%) into the curriculum-corrected-budget run, on H100 SXM. Still entirely inside phase 1 (single-domain only, steps 1-180k) - has never seen a mid-sequence domain switch yet. Single-domain BPB is already dramatically better than routed8s FINISHED 600k-step number across code/math/science (0.79/1.28/1.23 vs routed8s 1.20/2.38/2.28) - real, direct evidence the phase-1 curriculum builds much stronger per-domain understanding than the splice-from-step-1 recipe, even mid-training. As expected given zero switching exposure so far, cross-domain BPB (1.4021) is now WORSE than single-domain (1.3975) - the opposite of every other arm - and switch accuracy is only 9.3% (vs routed8s 27.75%). LAMBADA EM 2.91%/ppl 77.82 is weaker than routed8s finished numbers, consistent with being only 32% through training with an elevated cosine LR (routed8s own 33%-through checkpoint showed the same pattern: ppl 23.84 vs its finished 19.13). Phase 2 (switching) begins at step 180,001 - watch cross-domain BPB and switch accuracy specifically as the key signal for whether the curriculum recovers switching competence on top of the stronger single-domain foundation.",
+    "params": 89114364,
+    "per_domain_bpb": {
+      "code": 0.7933,
+      "math": 1.2761,
+      "nlp": 2.4521,
+      "science": 1.2342
+    },
+    "scale": "base",
+    "step": 96000,
+    "switch_accuracy": 0.0931
   },
   "routed2@150000": {
     "arm": "routed2",
@@ -541,5 +565,88 @@
     "params": 122223541,
     "scale": "base",
     "step": 150000
+  },
+  "routed19@167000": {
+    "arm": "routed19",
+    "scale": "base",
+    "step": 167000,
+    "params": 89114364,
+    "bpb_single": 1.3554,
+    "bpb_cross": 1.3631,
+    "switch_accuracy": 0.08,
+    "lambada_accuracy": 0.0276,
+    "lambada_accuracy_stopword_filtered": 0.0367,
+    "lambada_ppl": 73.59,
+    "per_domain_bpb": {
+      "code": 0.7533,
+      "math": 1.2234,
+      "science": 1.1757,
+      "nlp": 2.4427
+    },
+    "note": "SNAPSHOT, 167k/300k (56%) into the curriculum-corrected-budget run, on H100 SXM. Taken right after resuming from a mid-run crash: build_domain_cache.py was launched to expand the nlp/math local caches from 12GB to 30GB (to fix the phase1/phase2 cache-collision bug - see cache_pass_offset in stage2_config.py) while training was still live-reading those exact jsonl files via mmap; the cache builder opens its target in write/truncate mode, which SIGBUS-crashed the DataLoader workers at step 167600. Last good checkpoint was 167000 (only 600 steps lost). Restarted after both cache expansions finished, resuming cleanly from checkpoint at step 167001 with the cache_pass_offset fix and the new 30GB caches both now in effect. Still entirely inside phase 1 (single-domain only, ends at step 180000) so cross-domain BPB/switch accuracy are not yet expected to move - watch those specifically once phase 2 (real switching) begins at step 180001. Vs the @96000 snapshot (32% through, 3.15B tokens): single-domain BPB improved 1.3975->1.3554, cross-domain BPB improved 1.4021->1.3631; LAMBADA ppl improved 77.82->73.59 while EM ticked down slightly (2.91%->2.76%, within noise) and switch accuracy is flat (9.31%->8.00%) - both expected since neither checkpoint has real switch exposure yet."
+  },
+  "routed19@214000": {
+    "arm": "routed19",
+    "scale": "base",
+    "step": 214000,
+    "params": 89114364,
+    "bpb_single": 2.2003,
+    "bpb_cross": 1.3672,
+    "switch_accuracy": 0.2496,
+    "lambada_accuracy": 0.0159,
+    "lambada_accuracy_stopword_filtered": 0.0165,
+    "lambada_ppl": 85.73,
+    "per_domain_bpb": {
+      "code": 1.0373,
+      "math": 2.222,
+      "science": 2.2043,
+      "nlp": 3.4946
+    },
+    "note": "SNAPSHOT, 214k/300k (71%) into the curriculum-corrected-budget run, on H100 SXM. ~34k steps into phase 2 (real cross-domain switching, which starts at step 180001), after the crash/restart incident documented in the @167000 note. Mixed, notable result vs @167000 (still phase-1-only): switch-prediction accuracy roughly tripled (8.00%->24.96%), the curriculum intent working as designed on that axis. But single-domain BPB got dramatically WORSE (1.3554->2.2003), roughly uniformly across all 4 domains (code 0.75->1.04, math 1.22->2.22, science 1.18->2.20, nlp 2.44->3.49), and LAMBADA also regressed (EM 2.76%->1.59%, ppl 73.59->85.73). Cross-domain BPB stayed roughly flat (1.3631->1.3672) rather than improving - the switch-accuracy gain and the per-domain content-quality loss appear to be largely canceling out in that aggregate number. Open question: is this transient phase-2 shock (sudden shift from single-domain-only data to full switching) that recovers as the remaining ~86k steps let the model re-integrate single-domain skill with switching, or a real forgetting problem from the distribution shift outpacing relearning? Re-check in another 15-20k steps specifically on single-domain BPB trend before drawing conclusions."
+  },
+  "routed19@246000": {
+    "arm": "routed19",
+    "scale": "base",
+    "step": 246000,
+    "params": 89114364,
+    "bpb_single": 2.2963,
+    "bpb_cross": 1.3588,
+    "switch_accuracy": 0.2587,
+    "per_domain_bpb": {
+      "code": 1.1134,
+      "math": 2.372,
+      "science": 2.3183,
+      "nlp": 3.5268
+    },
+    "note": "SNAPSHOT, 246k/300k (82%) into the curriculum-corrected-budget run, on H100 SXM. ~66k steps into phase 2. No LAMBADA this round (quick BPB-only check). Compared to @214000 (34k into phase 2): single-domain BPB continued to get WORSE, not recover (2.2003->2.2963, every domain individually worse too: code 1.04->1.11, math 2.22->2.37, science 2.20->2.32, nlp 3.49->3.53). Cross-domain BPB stayed flat (1.3672->1.3588) and switch accuracy essentially plateaued (24.96%->25.87%, no longer climbing the way it did from @167000->@214000, 8.00%->24.96%). This is now two consecutive phase-2 checkpoints showing the same direction - single-domain competence still eroding, switch-accuracy gains stalled - which weakens the 'transient phase-2 shock that recovers' hypothesis from the @214000 note. Looks more like the model settling into a regime that's worse on single-domain and roughly flat on switching, rather than converging back toward phase-1 single-domain strength plus real switch competence. Only ~54k steps remain (run ends at 300000) - worth deciding whether this is acceptable as final behavior or whether phase-2 hyperparameters (e.g. LR schedule not decaying fast enough for the distribution shift) need revisiting for a future arm."
+  },
+  "routed19@260000": {
+    "arm": "routed19",
+    "scale": "base",
+    "step": 260000,
+    "params": 89114364,
+    "bpb_single": 2.3189,
+    "bpb_cross": 1.358,
+    "switch_accuracy": 0.264,
+    "lambada_accuracy": 0.0171,
+    "lambada_accuracy_stopword_filtered": 0.0184,
+    "lambada_ppl": 84.46,
+    "per_domain_bpb": {
+      "code": 1.1409,
+      "math": 2.4198,
+      "science": 2.3148,
+      "nlp": 3.5526
+    },
+    "note": "SNAPSHOT, 260k/300k (87%) - the checkpoint at the point training was paused overnight (graceful stop, not a crash). ~80k steps into phase 2. Third consecutive phase-2 checkpoint (167000 phase1 -> 214000 -> 246000 -> 260000) and the trend is now conclusive, not transient: single-domain BPB has monotonically gotten WORSE every single check (1.3554 -> 2.2003 -> 2.2963 -> 2.3189), cross-domain BPB and switch accuracy have both plateaued (cross: 1.3631/1.3672/1.3588/1.3580, switch: 8.00%/24.96%/25.87%/26.40% - switch accuracy's climb stalled after the first phase-2 checkpoint too). LAMBADA likewise shows no recovery (73.59 -> 85.73 -> [no read] -> 84.46 ppl). This closes the 'is it transient phase-2 shock that recovers' question from the @214000 note: it is not recovering with the steps/LR budget remaining. Root-cause analysis (this session): the phase-1/phase-2 transition confounds THREE shocks simultaneously - (1) domain switching turns on, (2) snippet_words collapses 12x (3000->250, an unrelated context-length shock), (3) LR is still 35% of peak (1.04e-4) at the transition, decaying to single digits % by the time we're checking in, meaning there's little LR budget left to recover from whatever damage was done at the shock. Code-level check confirmed no config bug at the boundary - grad_accum, switch_weight, batch size, LR schedule are all identical across it; only the data loader changes. Verdict: routed19's from-scratch curriculum-staging hypothesis is REJECTED by this run - it underperforms routed17's simultaneous-mixing recipe on every metric except switch accuracy, despite consuming ~2.8x more real tokens (8.5B vs routed17's full ~2.87B-token lineage) by this point. Training paused here (step 260000) overnight for cost reasons; resume command auto-continues from this checkpoint if the remaining ~40k steps are still wanted for completeness, but the core finding is already conclusive."
+  },
+  "routed14@100000": {
+    "arm": "routed14",
+    "scale": "large",
+    "step": 100000,
+    "lambada_accuracy": 0.0949,
+    "lambada_accuracy_stopword_filtered": 0.0982,
+    "lambada_ppl": 10.58,
+    "lambada_bits_per_target_token": 3.403,
+    "note": "routed11's copy-gate mechanism at large scale (190M), warm-started from large_routed7, 100k/100k continued training. [Same evaluate_lambada() measurement bug as routed11/16 - see routed16@100000's note. Re-scored with the fix: EM 9.49%, ppl 10.58 - confirms routed11's result (9.86%/10.18 at base scale) isn't a base-scale fluke; the copy-gate mechanism's real LAMBADA win holds at 190M too.]"
   }
 }

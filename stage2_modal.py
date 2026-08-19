@@ -1444,21 +1444,41 @@ def generate(arm: str = "mot", checkpoint_step: int = 150000, seed_domain: str =
     from src.model.mot_model import MoTModel
     from src.model.mot_pooled2_model import MoTPooled2Model
     from src.model.mot_pooled_model import MoTPooledModel
+    from src.model.mot_routed_copygate_model import MoTRoutedCopyGateModel
     from src.model.mot_routed_model import MoTRoutedModel
-    from src.model.stage2_config import BACKBONE_ONLY_CFG, CONFIDENCE_WEIGHT, FOCAL_GAMMA, MODEL_CFG
+    from src.model.stage2_config import (
+        BACKBONE_ONLY_CFG, CONFIDENCE_WEIGHT, COPYGATE_V2_BIAS_INIT, FOCAL_GAMMA, MODEL_CFG,
+    )
 
     device = "cuda"
     seq_len = MODEL_CFG["max_seq_len"]
-    bundle = TokenizerBundle(tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2")
+    # OWT_TOKENIZER_ARMS (see train_stage2_pod.py) - everything sourcing nlp from OpenWebText
+    # with routed8's own OWT-fit tokenizer, not the default tokenizers_stage2 dir. Missing
+    # this for any of these arms means the nlp vocab size in `bundle` doesn't match the
+    # checkpoint's - load_state_dict would fail outright, not silently misbehave.
+    owt_tok_arms = ("routed7", "routed8", "routed11", "routed12", "routed13", "routed14",
+                     "routed15", "routed16", "routed17", "routed18", "routed19",
+                     "routed20", "routed21", "routed22", "routed23")
+    bundle = TokenizerBundle(
+        tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
+        nlp_tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp" if arm in owt_tok_arms else None,
+    )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{arm}_step{checkpoint_step}.pt", map_location=device)
     domains = list(bundle.domain_vocab_sizes)
     domain_index = {d: i for i, d in enumerate(domains)}
-    switching = arm in ("routed", "pooled", "hybrid", "pooled2", "routed2", "routed3")
+    copygate_arms = ("routed11", "routed14", "routed16", "routed20", "routed21", "routed22")
+    switching = arm in ("routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed7",
+                         "routed8", "routed17", "routed18", "routed19", "routed23") + copygate_arms
     domain_routed = arm == "mot" or switching
 
-    if arm == "mot":
+    if arm in copygate_arms:
+        model = MoTRoutedCopyGateModel(
+            domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
+            gate_bias_init=COPYGATE_V2_BIAS_INIT if arm == "routed16" else 0.0,
+        ).to(device)
+    elif arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    elif arm == "routed":
+    elif arm in ("routed", "routed7", "routed8", "routed17", "routed18", "routed19", "routed23"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "pooled":
         model = MoTPooledModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,

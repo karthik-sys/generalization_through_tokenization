@@ -254,6 +254,8 @@ NEW_MODULE_MATCH = {
     "routed14": ("copy_q.", "copy_k.", "copy_gate."),  # same mechanism as routed11, at large scale
     "routed15": (),  # control - no new module, ALL params at BET_BACKBONE_LR_SCALE
     "routed16": ("copy_q.", "copy_k.", "copy_gate."),  # same mechanism, but see FROZEN_BACKBONE_ARMS
+    "routed20": ("copy_q.", "copy_k.", "copy_gate."),  # same LR treatment as routed11 - see ALIGN_ARMS
+    "routed21": ("copy_q.", "copy_k.", "copy_gate."),  # routed20's no-alignment control
 }
 
 # routed7 (extended) and routed8 target ~600,000 steps rather than the usual 150,000. At
@@ -283,11 +285,59 @@ WARM_START_PARENT = {
     "routed11": "routed8", "routed12": "routed8", "routed13": "routed8",
     "routed14": "large_routed7",  # NOT routed8 - wrong param count (89M) to warm-start a 190M model from
     "routed15": "routed8", "routed16": "routed8", "routed17": "routed8", "routed18": "routed8",
+    "routed20": "routed17", "routed21": "routed17",  # NOT routed8 - parent is the ALREADY diet-
+    # adapted routed17@100000, not the pre-diet routed8@600000, so copy-gate is the only genuinely
+    # new thing being learned during continuation (mixture stays 70% nlp throughout, it doesn't
+    # have to be picked up from scratch at the same time as the new module). routed22/23
+    # deliberately absent - from scratch, no parent at all.
 }
 COOLDOWN_STEPS = 50000  # ~1/3 of a full run - cheap, and the backbone is already trained
 COOLDOWN_BACKBONE_LR_SCALE = 0.1  # warm-started params (everything but nlp) train 10x slower
                                     # than the freshly-reinitialized nlp branch, so the cooldown
                                     # doesn't undo what the parent checkpoint already learned
+
+# routed20/21/22/23: the four-way ablation launched the night evaluate_lambada's copy-gate
+# measurement bug was found and fixed (see mot_routed_copygate_model.py). Two real, newly-
+# CONFIRMED findings drive this set: (1) routed11's copy-gate mechanism - unbiased gate init,
+# backbone throttled (not frozen) at BET_BACKBONE_LR_SCALE, warm-started from routed8 - is the
+# best LAMBADA result in the project once actually measured (EM 9.86%/ppl 10.18, beating
+# routed17's diet recipe AND routed16's "conservative init" follow-up that was motivated by
+# routed11 looking unpromising under the SAME broken measurement); (2) routed19's from-scratch
+# curriculum staging demonstrated real, sustained interference between single-domain
+# competence and cross-domain switching when the shared backbone is retrained through a
+# distribution shift - motivating a purely additive fix instead (domain_embedding_alignment_
+# loss on MoTRoutedModel, CORAL-style mean+covariance matching across domain embedding
+# TABLES, not activations - cheap enough to add every ALIGN_LOSS_EVERY steps rather than every
+# step). Priority order for this set, per explicit instruction: best LAMBADA EM first, then
+# single-domain BPB, then cross-domain BPB.
+#
+#   routed20: copy-gate (unbiased init) + diet (DIET_PHASE2_NLP_SNIPPET_WORDS, still 70% nlp
+#             through continuation) + alignment loss, warm-started from routed17@100000 (NOT
+#             routed8 - routed17 already did the diet adaptation, so copy-gate is the only
+#             genuinely new thing this continuation has to learn - copy-gate and diet have
+#             never been stacked before this). routed11's exact LR treatment (NEW_MODULE_MATCH,
+#             BET_BACKBONE_LR_SCALE=0.3, not COOLDOWN's gentler 0.1 - v1 beat v2's more-frozen
+#             treatment, so plasticity is plausibly part of why it works; don't over-protect).
+#             Flagship candidate - every proven-or-plausible EM/cross-domain lever stacked.
+#             Rough target given routed11 alone already reached EM 9.86%/ppl 10.18: this
+#             should beat both, since it adds a second independently-real EM lever on top.
+#   routed21: identical to routed20 MINUS the alignment loss - copy-gate-on-diet in isolation,
+#             the single most important control, isolating what alignment actually contributes
+#             on top of the (expected-strong-on-its-own) copy-gate+diet combination.
+#   routed22: copy-gate (unbiased init) ALONE, from scratch (no warm start, no diet, no
+#             alignment), uniform LR. Tests the copy-gate docstring's own claim that "the
+#             mechanism is useless until the backbone already produces good representations
+#             to attend with" - a real, previously untested hypothesis now that we know the
+#             warm-started version works this well.
+#   routed23: alignment loss ALONE, from scratch, plain MoTRoutedModel (no copy-gate, no
+#             diet), uniform LR. Pure isolation of the alignment mechanism's own contribution
+#             to cross-domain BPB/switch accuracy, uncontaminated by copy-gate or diet -
+#             the direct test of the Priority-3 (cross-domain) architectural fix on its own.
+ALIGN_ARMS = ("routed20", "routed23")
+ALIGN_LOSS_WEIGHT = 0.05  # middle of the recommended 0.01-0.1 range
+ALIGN_LOSS_EVERY = 50  # operates on embedding TABLES (fixed size), not batch activations -
+                        # tables move slowly relative to one optimizer step, safe to skip most
+FROM_SCRATCH_COPYGATE_ARMS = ("routed22",)  # routed22 only - routed20/21 are copygate+warm-started
 BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS = 600  # vs the other domains' default SNIPPET_WORDS=250
 
 # arm="hybrid" only: fraction of training steps drawing a natural single-domain batch

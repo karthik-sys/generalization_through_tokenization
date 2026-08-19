@@ -173,6 +173,42 @@ class MoTRoutedModel(nn.Module):
             per_domain[domain] = loss.item() / n
         return total_loss / max(total_count, 1), per_domain
 
+    def domain_embedding_alignment_loss(self) -> torch.Tensor:
+        """CORAL-style distributional alignment across domain embedding TABLES (not
+        activations) - Tier 1 fix for the cross-domain correlation gap identified during
+        routed19's post-mortem: every domain gets a fully independent nn.Embedding with a
+        disjoint vocab (separate tokenizers per domain), so nothing forces e.g. science's
+        and nlp's tables into a shared region of R^emb_dim. The backbone has to bridge
+        whatever gap opened up between them at every switch, with only the domain-tag
+        control token as a hint.
+
+        There's no token-level correspondence to align on (independently-tokenized vocabs
+        share no subword inventory), so this matches DISTRIBUTIONS instead: for each pair
+        of domains, penalize the squared difference between their embedding tables'
+        (centered) covariance matrices and their mean vectors. Operates on the tables
+        themselves (shape (V_d, emb_dim), fixed size regardless of batch), not per-batch
+        activations - independent of batch composition, and cheap enough that the caller
+        can compute this only every K steps rather than every step without losing anything
+        (the tables move slowly relative to a single optimizer step).
+        """
+        domains = list(self.embeddings.keys())
+        stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        for d in domains:
+            E = self.embeddings[d].weight  # (V_d, emb_dim)
+            mu = E.mean(dim=0)
+            centered = E - mu
+            cov = (centered.T @ centered) / max(E.shape[0] - 1, 1)
+            stats[d] = (mu, cov)
+        loss = self.control_embedding.weight.new_zeros(())
+        n_pairs = 0
+        for i in range(len(domains)):
+            for j in range(i + 1, len(domains)):
+                mu_i, cov_i = stats[domains[i]]
+                mu_j, cov_j = stats[domains[j]]
+                loss = loss + (cov_i - cov_j).pow(2).sum() + (mu_i - mu_j).pow(2).sum()
+                n_pairs += 1
+        return loss / max(n_pairs, 1)
+
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 

@@ -44,7 +44,8 @@ from src.model.mot_routed_deepexpert_model import DEFAULT_N_EXPERT_LAYERS, MoTRo
 from src.model.mot_routed_model import MoTRoutedModel
 from src.model.mot_routed_precision_model import MoTRoutedPrecisionModel
 from src.model.stage2_config import (
-    ADV_LAMBDA_RAMP_STEPS, ARM_LABELS, BACKBONE_ONLY_CFG, BATCH_SIZE, BET_BACKBONE_LR_SCALE,
+    ADV_LAMBDA_RAMP_STEPS, ALIGN_ARMS, ALIGN_LOSS_EVERY, ALIGN_LOSS_WEIGHT, ARM_LABELS,
+    BACKBONE_ONLY_CFG, BATCH_SIZE, BET_BACKBONE_LR_SCALE,
     BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS, CHECKPOINT_EVERY, CONFIDENCE_WEIGHT, COOLDOWN_BACKBONE_LR_SCALE,
     COPY_MINE_MIN_GAP, COPY_MINE_MIN_WORD_LEN, COPYGATE_V2_BIAS_INIT, DIET_PHASE2_NLP_SNIPPET_WORDS,
     FOCAL_GAMMA, FROZEN_BACKBONE_ARMS, GRAD_ACCUM_STEPS, HYBRID_NATURAL_DATA_FRACTION, LOG_EVERY,
@@ -61,8 +62,15 @@ BET_ARMS = ("routed11", "routed12", "routed13", "routed14", "routed15", "routed1
 LARGE_BET_ARMS = ("routed14",)  # subset of BET_ARMS that forces scale="large" (see _build_model)
 DIET_ARMS = ("routed17", "routed18")  # round-2 data-lever arms: force_domain="nlp" upweighting,
 # same mechanism as routed9/10 but no reinit (nlp-vs-rest differential LR via WARM_START_PARENT)
-OWT_TOKENIZER_ARMS = ("routed7", "routed8", "routed19") + BET_ARMS + DIET_ARMS  # everything sourcing nlp from
-# OpenWebText with routed8's own OWT-fit tokenizer (routed9/10 use PG-19 books instead)
+# routed20/21/22/23: the copy-gate-fix-night four-way ablation (see ALIGN_ARMS's comment block
+# in stage2_config.py for the full rationale). RECIPE_ARMS is every one of them (for the
+# generic step-loop dispatch, which is identical to BET_ARMS/DIET_ARMS's shape - plain
+# model(tok, dom, ctrl, targets=tgt, ...) call); RECIPE_DIET_ARMS is the subset using the
+# diet (nlp-upweighted) loader rather than the plain one.
+RECIPE_ARMS = ("routed20", "routed21", "routed22", "routed23")
+RECIPE_DIET_ARMS = ("routed20", "routed21")
+OWT_TOKENIZER_ARMS = ("routed7", "routed8", "routed19") + BET_ARMS + DIET_ARMS + RECIPE_ARMS  # everything
+# sourcing nlp from OpenWebText with routed8's own OWT-fit tokenizer (routed9/10 use PG-19 books instead)
 
 # Every DataLoader in this file used to default to num_workers=0 - synchronous, single-
 # process data loading, meaning the GPU sat idle every micro-step while Python fetched +
@@ -329,15 +337,25 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
         raise ValueError(f"scale=large supports mot/baseline/routed/routed3/routed7/routed10/routed14, not {arm}")
     if arm == "mot":
         return MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    if arm in ("routed", "routed8", "routed9", "routed15", "routed17", "routed18", "routed19"):
+    if arm in ("routed", "routed8", "routed9", "routed15", "routed17", "routed18", "routed19", "routed23"):
         # routed8/routed9: identical architecture to plain routed - only the nlp data source
         # (OpenWebText or PG-19 books, applied by _apply_openwebtext_nlp_source /
         # _apply_books_nlp_source in calibrate()/train()) and, for routed9, the warm-start +
         # mixture upweighting, differ. routed15 (control), routed17/18 (diet-phase data levers),
         # routed19 (curriculum + corrected token budget) are the same story - no architecture
-        # change, only data/LR/step-count treatment differs.
+        # change, only data/LR/step-count treatment differs. routed23: alignment-loss-only
+        # ablation, plain architecture, from scratch - see ALIGN_ARMS in stage2_config.py.
         return MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     if arm == "routed11":  # Bet 1: copy gate on the nlp head, warm-started from routed8
+        return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    if arm in ("routed20", "routed21", "routed22"):
+        # routed20/21: copy-gate + diet, warm-started from routed8 (routed11's exact recipe,
+        # now proven to be the project's best LAMBADA result once actually measured - see
+        # ALIGN_ARMS's comment block in stage2_config.py). routed22: same mechanism, but from
+        # scratch, no diet - tests whether copy-gate needs a warm-started backbone to be
+        # useful at all. Unbiased default gate_bias_init throughout (routed11's init, not
+        # routed16's -4.0 "conservative" one - the conservative init underperformed once
+        # correctly measured, so there's no reason to carry it into this set).
         return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     if arm == "routed16":  # Bet 1 v2: same mechanism, conservative gate init (see routed11/14 post-mortem)
         return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
@@ -439,6 +457,18 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
         loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"], force_domain="nlp",
         ), batch_size=BATCH_SIZE))
+    elif arm in RECIPE_DIET_ARMS:
+        # routed20/21: copy-gate stacked on top of routed17's already-diet-adapted mixture -
+        # same nlp upweighting as DIET_ARMS, kept through continuation (not reverted to plain),
+        # so the model isn't asked to un-learn the mixture it's continuing from.
+        loader = iter(_ld(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"],
+            force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
+        ), batch_size=BATCH_SIZE))
+    elif arm in ("routed22", "routed23"):
+        # from scratch, plain (non-upweighted) mixture - routed22 isolates whether copy-gate
+        # needs a warm-started backbone at all; routed23 isolates the alignment loss alone.
+        loader = iter(_ld(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
         loader = iter(_ld(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
@@ -484,7 +514,7 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
-        elif arm in ("routed", "pooled", "pooled2", "routed5", "routed6", "routed7", "routed8", "routed9", "routed10") + BET_ARMS + DIET_ARMS:
+        elif arm in ("routed", "pooled", "pooled2", "routed5", "routed6", "routed7", "routed8", "routed9", "routed10") + BET_ARMS + DIET_ARMS + RECIPE_ARMS:
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
             with torch.autocast("cuda"):
@@ -729,6 +759,18 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"], force_domain="nlp",
         ), batch_size=BATCH_SIZE))
+    elif arm in RECIPE_DIET_ARMS:
+        # routed20/21: copy-gate stacked on top of routed17's already-diet-adapted mixture -
+        # same nlp upweighting as DIET_ARMS, kept through continuation (not reverted to plain),
+        # so the model isn't asked to un-learn the mixture it's continuing from.
+        loader = iter(_ld(PackedRoutedStream(
+            bundle, domain_index, MODEL_CFG["max_seq_len"],
+            force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
+        ), batch_size=BATCH_SIZE))
+    elif arm in ("routed22", "routed23"):
+        # from scratch, plain (non-upweighted) mixture - routed22 isolates whether copy-gate
+        # needs a warm-started backbone at all; routed23 isolates the alignment loss alone.
+        loader = iter(_ld(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
         loader = iter(_ld(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm == "routed3":
@@ -832,7 +874,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             with torch.autocast("cuda"):
                 logits = model(domain, inp, types[:, :-1])
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
-        elif arm in ("routed", "routed7", "routed8", "routed9", "routed10") + BET_ARMS + DIET_ARMS:
+        elif arm in ("routed", "routed7", "routed8", "routed9", "routed10") + BET_ARMS + DIET_ARMS + RECIPE_ARMS:
             tok, dom, ctrl, typ, tgt = next(loader)
             if arm in FROZEN_BACKBONE_ARMS and not (dom == domain_index["nlp"]).any():
                 # force_domain guarantees nlp presence per synthetic DOC, but PackedRoutedStream
@@ -845,6 +887,13 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
             with torch.autocast("cuda"):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
+            if arm in ALIGN_ARMS and step % ALIGN_LOSS_EVERY == 0:
+                # CORAL-style cross-domain embedding-table alignment (see domain_embedding_
+                # alignment_loss in mot_routed_model.py) - operates on the tables themselves,
+                # not batch activations, so it's independent of what happened to be in THIS
+                # batch and safe to add only periodically. raw_model, not model: DDP wraps
+                # forward() but doesn't forward custom methods to the wrapped module.
+                loss = loss + ALIGN_LOSS_WEIGHT * raw_model.domain_embedding_alignment_loss()
         elif arm == "routed19":
             # step, not an internal call counter, drives the phase switch - correct across
             # resumes (start_step is loaded from the checkpoint), unlike a loader-internal
