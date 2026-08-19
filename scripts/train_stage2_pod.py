@@ -1055,7 +1055,8 @@ if __name__ == "__main__":
                          choices=["mot", "baseline", "sota", "routed", "pooled", "hybrid", "pooled2",
                                   "routed2", "routed3", "routed4", "routed5", "routed6", "routed7",
                                   "routed8", "routed9", "routed10", "routed11", "routed12", "routed13",
-                                  "routed14", "routed15", "routed16", "routed17", "routed18", "routed19"])
+                                  "routed14", "routed15", "routed16", "routed17", "routed18", "routed19",
+                                  "routed20", "routed21", "routed22", "routed23", "routed24"])
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--scale", choices=["base", "large"], default="base",
                          help="'large' (mot/baseline only) uses LARGE_MODEL_CFG for the scale test")
