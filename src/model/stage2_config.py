@@ -342,6 +342,18 @@ ROUTED19_PHASE1_FRACTION = 0.6
 # real reduction in switch density, not a hard single-domain-per-window guarantee.
 ROUTED19_PHASE1_SNIPPET_WORDS = 3000
 
+# routed19 only: phase1_loader and phase2_loader are two INDEPENDENTLY-constructed
+# PackedRoutedStream instances, each spawning their own DataLoader workers - but PyTorch's
+# worker_id resets to 0..NUM_WORKERS-1 PER DataLoader instance, so phase1's worker 0 and
+# phase2's worker 0 both compute the same shard_id and, without this offset, would both start
+# reading the local cache's shuffled permutation from pass_num=0 - the SAME sequence, from the
+# SAME starting point. Confirmed live on the actual routed19 run: phase 2 would have
+# substantially re-read material phase 1 already consumed instead of getting fresh data.
+# Any distinct, sufficiently-large offset works - reseeds the permutation into unrelated
+# territory. 10,000 is arbitrary but far larger than any realistic pass_num phase 1 could reach
+# on its own (each pass reshuffles the WHOLE cache, so even a few hundred passes is a lot).
+ROUTED19_PHASE2_CACHE_PASS_OFFSET = 10_000
+
 # routed19 only: BATCH_SIZE=4 (global) was deliberately kept small to bound sota's 100k-vocab
 # logits tensor (batch*seq*vocab*4 bytes - see the comment above BATCH_SIZE). routed19 is a
 # domain-routed arm with per-domain vocabs in the ~30-40k range (much smaller than sota's

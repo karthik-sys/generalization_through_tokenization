@@ -50,7 +50,8 @@ from src.model.stage2_config import (
     FOCAL_GAMMA, FROZEN_BACKBONE_ARMS, GRAD_ACCUM_STEPS, HYBRID_NATURAL_DATA_FRACTION, LOG_EVERY,
     LONGCTX_MODEL_CFG, LR, MAX_STEPS, MODEL_CFG, NEW_MODULE_MATCH, ROUTED3_MAX_DOMAINS,
     ROUTED3_MIN_DOMAINS, ROUTED3_SNIPPET_WORDS, ROUTED19_BATCH_SIZE, ROUTED19_GRAD_ACCUM_STEPS,
-    ROUTED19_PHASE1_FRACTION, ROUTED19_PHASE1_SNIPPET_WORDS, SWITCH_WEIGHT, WARM_START_PARENT,
+    ROUTED19_PHASE1_FRACTION, ROUTED19_PHASE1_SNIPPET_WORDS, ROUTED19_PHASE2_CACHE_PASS_OFFSET,
+    SWITCH_WEIGHT, WARM_START_PARENT,
     WARMUP_STEPS,
 )
 
@@ -453,6 +454,7 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
         ), batch_size=routed19_batch_size))
         phase2_loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
+            cache_pass_offset=ROUTED19_PHASE2_CACHE_PASS_OFFSET,
         ), batch_size=routed19_batch_size))
         routed19_phase1_steps = round(steps * ROUTED19_PHASE1_FRACTION)
     elif arm in ("routed4", "routed6"):  # both use 2x context
@@ -742,6 +744,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         ), batch_size=routed19_batch_size))
         phase2_loader = iter(_ld(PackedRoutedStream(
             bundle, domain_index, MODEL_CFG["max_seq_len"],
+            cache_pass_offset=ROUTED19_PHASE2_CACHE_PASS_OFFSET,
         ), batch_size=routed19_batch_size))
         routed19_phase1_steps = round(total_steps * ROUTED19_PHASE1_FRACTION)
         print(f"routed19 curriculum: phase 1 (single-domain) steps 1-{routed19_phase1_steps}, "

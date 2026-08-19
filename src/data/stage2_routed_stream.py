@@ -32,15 +32,19 @@ MIN_DOMAINS_PER_DOC = 2
 MAX_DOMAINS_PER_DOC = 4
 
 
-def _raw_body_stream(domain: str) -> Iterator[str]:
+def _raw_body_stream(domain: str, pass_offset: int = 0) -> Iterator[str]:
     """Yields plain body text (no tag) for one domain, cycling forever.
 
     No domain-specific branch here anymore - code used to hardcode the-stack-smol with its
     own inline language filter, bypassing STREAM_SOURCES/TEXT_EXTRACTORS entirely. Now that
     TEXT_EXTRACTORS['code'] does its own language+license filtering (see stage2_stream_
     dataset.py), the generic path below works for every domain, code included.
+
+    pass_offset: see _cached_doc_stream's docstring - lets two independently-constructed
+    streams (e.g. routed19's phase1/phase2 loaders) read the SAME local cache from genuinely
+    different starting points instead of silently colliding on the same pass_num=0 sequence.
     """
-    cached = _cached_doc_stream(domain)
+    cached = _cached_doc_stream(domain, pass_offset=pass_offset)
     if cached is not None:
         yield from cached
         return
@@ -101,11 +105,11 @@ def _is_copy_structured(text: str, min_word_len: int, min_gap: int) -> bool:
     return False
 
 
-def _filtered_body_stream(domain: str, min_word_len: int, min_gap: int) -> Iterator[str]:
+def _filtered_body_stream(domain: str, min_word_len: int, min_gap: int, pass_offset: int = 0) -> Iterator[str]:
     """Like _raw_body_stream, but only yields documents passing _is_copy_structured -
     skips (not discards forever) documents that don't qualify, cycling the underlying
     source the same way _raw_body_stream does."""
-    for text in _raw_body_stream(domain):
+    for text in _raw_body_stream(domain, pass_offset=pass_offset):
         if _is_copy_structured(text, min_word_len, min_gap):
             yield text
 
@@ -115,6 +119,7 @@ def synthetic_multidomain_doc_stream(
     snippet_words: int = SNIPPET_WORDS, force_domain: str | None = None,
     force_domain_snippet_words: int | None = None,
     force_domain_filter: tuple[int, int] | None = None,
+    cache_pass_offset: int = 0,
 ) -> Iterator[str]:
     """Yields doc strings shaped like build_multidomain_docs.py's output, built live.
 
@@ -135,13 +140,18 @@ def synthetic_multidomain_doc_stream(
     force_domain_filter=(min_word_len, min_gap) (arm routed18 only): additionally restricts
     force_domain's source to documents passing _is_copy_structured - only documents with
     LAMBADA-shaped internal recurrence get used at all for that domain.
+
+    cache_pass_offset (routed19's phase1/phase2 curriculum): passed straight through to the
+    local-cache read path (see _cached_doc_stream's docstring) so two independently-constructed
+    streams reading the SAME cache (e.g. phase1 vs phase2) start from genuinely different points
+    in the shuffled order instead of silently colliding on the same pass_num=0 sequence.
     """
     rng = random.Random(seed)
     domains = list(STREAM_SOURCES)
-    body_streams = {d: _raw_body_stream(d) for d in domains}
+    body_streams = {d: _raw_body_stream(d, pass_offset=cache_pass_offset) for d in domains}
     if force_domain and force_domain_filter is not None:
         min_word_len, min_gap = force_domain_filter
-        body_streams[force_domain] = _filtered_body_stream(force_domain, min_word_len, min_gap)
+        body_streams[force_domain] = _filtered_body_stream(force_domain, min_word_len, min_gap, pass_offset=cache_pass_offset)
     other_domains = [d for d in domains if d != force_domain] if force_domain else domains
     while True:
         if force_domain:
@@ -167,6 +177,7 @@ class PackedRoutedStream(IterableDataset):
         snippet_words: int = SNIPPET_WORDS, force_domain: str | None = None,
         force_domain_snippet_words: int | None = None,
         force_domain_filter: tuple[int, int] | None = None,
+        cache_pass_offset: int = 0,
     ):
         self.bundle = bundle
         self.domain_index = domain_index
@@ -179,12 +190,14 @@ class PackedRoutedStream(IterableDataset):
         self.force_domain = force_domain
         self.force_domain_snippet_words = force_domain_snippet_words
         self.force_domain_filter = force_domain_filter
+        self.cache_pass_offset = cache_pass_offset
 
     def __iter__(self):
         buf_tok, buf_dom, buf_ctrl, buf_typ = [], [], [], []
         doc_stream = synthetic_multidomain_doc_stream(
             self.seed, self.min_domains, self.max_domains, self.snippet_words,
-            self.force_domain, self.force_domain_snippet_words, self.force_domain_filter)
+            self.force_domain, self.force_domain_snippet_words, self.force_domain_filter,
+            self.cache_pass_offset)
         for doc in doc_stream:
             for domain, text in _split_spans(doc):
                 if domain not in self.domain_index:

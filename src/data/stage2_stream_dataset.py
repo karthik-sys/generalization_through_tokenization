@@ -80,7 +80,7 @@ def _line_offsets(path: Path) -> "np.ndarray":
     return arr
 
 
-def _cached_doc_stream(domain: str) -> Iterator[str] | None:
+def _cached_doc_stream(domain: str, pass_offset: int = 0) -> Iterator[str] | None:
     """Returns a forever-looping iterator over a local JSONL cache if one exists for this
     domain, else None (caller falls back to the live HF stream).
 
@@ -93,7 +93,19 @@ def _cached_doc_stream(domain: str) -> Iterator[str] | None:
     happening. mmap gives memory-safe random access (shared read-only OS pages across every
     worker process, not a private copy) to a genuinely shuffled permutation of line offsets,
     with each (rank, worker) pair getting an EXACT, non-overlapping partition - both problems
-    fixed by the same change, not two separate patches."""
+    fixed by the same change, not two separate patches.
+
+    pass_offset (routed19's phase1/phase2 curriculum, and any future multi-phase run): two
+    independently-constructed PackedRoutedStream loaders (e.g. phase1_loader/phase2_loader in
+    train_stage2_pod.py) each spawn their OWN DataLoader workers, and PyTorch's worker_id resets
+    to 0..num_workers-1 PER DataLoader instance - so phase1's worker 0 and phase2's worker 0 both
+    compute shard_id=0 and, without this, both start their permutation at pass_num=0, reading the
+    SAME shuffled sequence from the SAME starting point. Confirmed live on routed19: phase 2 would
+    have substantially re-read material phase 1 already consumed instead of getting fresh data.
+    Passing a distinct pass_offset per phase reseeds the permutation into unrelated territory -
+    cheap, doesn't require a bigger cache to fix (though a bigger cache still helps, since a small
+    cache means both phases' permutations still draw from the same small pool of underlying docs,
+    just in a different order)."""
     import mmap as mmap_module
 
     import numpy as np
@@ -110,7 +122,7 @@ def _cached_doc_stream(domain: str) -> Iterator[str] | None:
     def _gen():
         with open(path, "rb") as f:
             mm = mmap_module.mmap(f.fileno(), 0, access=mmap_module.ACCESS_READ)
-            pass_num = 0
+            pass_num = pass_offset
             try:
                 while True:
                     # Same base seed on every rank/worker (a real requirement, not a bug -
