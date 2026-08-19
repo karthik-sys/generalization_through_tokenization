@@ -49,7 +49,8 @@ from src.model.stage2_config import (
     BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS, CHECKPOINT_EVERY, CONFIDENCE_WEIGHT, COOLDOWN_BACKBONE_LR_SCALE,
     COPY_MINE_MIN_GAP, COPY_MINE_MIN_WORD_LEN, COPYGATE_V2_BIAS_INIT, DIET_PHASE2_NLP_SNIPPET_WORDS,
     FOCAL_GAMMA, FROZEN_BACKBONE_ARMS, GRAD_ACCUM_STEPS, HYBRID_NATURAL_DATA_FRACTION, LOG_EVERY,
-    LONGCTX_MODEL_CFG, LR, MAX_STEPS, MODEL_CFG, NEW_MODULE_MATCH, ROUTED3_MAX_DOMAINS,
+    LONGCTX_MODEL_CFG, LR, MAX_STEPS, MODEL_CFG, NEW_MODULE_MATCH, PER_ARM_BACKBONE_LR_SCALE,
+    ROUTED3_MAX_DOMAINS,
     ROUTED3_MIN_DOMAINS, ROUTED3_SNIPPET_WORDS, ROUTED19_BATCH_SIZE, ROUTED19_GRAD_ACCUM_STEPS,
     ROUTED19_PHASE1_FRACTION, ROUTED19_PHASE1_SNIPPET_WORDS, ROUTED19_PHASE2_CACHE_PASS_OFFSET,
     SWITCH_WEIGHT, WARM_START_PARENT,
@@ -67,7 +68,7 @@ DIET_ARMS = ("routed17", "routed18")  # round-2 data-lever arms: force_domain="n
 # generic step-loop dispatch, which is identical to BET_ARMS/DIET_ARMS's shape - plain
 # model(tok, dom, ctrl, targets=tgt, ...) call); RECIPE_DIET_ARMS is the subset using the
 # diet (nlp-upweighted) loader rather than the plain one.
-RECIPE_ARMS = ("routed20", "routed21", "routed22", "routed23")
+RECIPE_ARMS = ("routed20", "routed21", "routed22", "routed23", "routed24")
 RECIPE_DIET_ARMS = ("routed20", "routed21")
 OWT_TOKENIZER_ARMS = ("routed7", "routed8", "routed19") + BET_ARMS + DIET_ARMS + RECIPE_ARMS  # everything
 # sourcing nlp from OpenWebText with routed8's own OWT-fit tokenizer (routed9/10 use PG-19 books instead)
@@ -348,12 +349,15 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
         return MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     if arm == "routed11":  # Bet 1: copy gate on the nlp head, warm-started from routed8
         return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    if arm in ("routed20", "routed21", "routed22"):
-        # routed20/21: copy-gate + diet, warm-started from routed8 (routed11's exact recipe,
+    if arm in ("routed20", "routed21", "routed22", "routed24"):
+        # routed20/21: copy-gate + diet, warm-started from routed17 (routed11's exact recipe,
         # now proven to be the project's best LAMBADA result once actually measured - see
         # ALIGN_ARMS's comment block in stage2_config.py). routed22: same mechanism, but from
         # scratch, no diet - tests whether copy-gate needs a warm-started backbone to be
-        # useful at all. Unbiased default gate_bias_init throughout (routed11's init, not
+        # useful at all. routed24: routed11's exact recipe amped up (full backbone plasticity
+        # instead of 0.3x, see PER_ARM_BACKBONE_LR_SCALE) - not a plain rerun, a test of
+        # whether the "less throttle helped" trend continues further. Unbiased default
+        # gate_bias_init throughout (routed11's init, not
         # routed16's -4.0 "conservative" one - the conservative init underperformed once
         # correctly measured, so there's no reason to carry it into this set).
         return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
@@ -465,9 +469,10 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
-    elif arm in ("routed22", "routed23"):
-        # from scratch, plain (non-upweighted) mixture - routed22 isolates whether copy-gate
-        # needs a warm-started backbone at all; routed23 isolates the alignment loss alone.
+    elif arm in ("routed22", "routed23", "routed24"):
+        # plain (non-upweighted) mixture, matching routed11 exactly for routed24 - routed22
+        # isolates whether copy-gate needs a warm-started backbone at all; routed23 isolates
+        # the alignment loss alone; routed24 isolates backbone plasticity (see _build_model).
         loader = iter(_ld(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
         loader = iter(_ld(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
@@ -646,9 +651,14 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         if match:
             new_params = [p for n, p in model.named_parameters() if any(s in n for s in match)]
             old_params = [p for n, p in model.named_parameters() if not any(s in n for s in match)]
+            # PER_ARM_BACKBONE_LR_SCALE overrides the default BET_BACKBONE_LR_SCALE for a
+            # specific arm - routed24 uses 1.0 (no throttle at all) to test whether more
+            # backbone plasticity than routed11's 0.3x helps further, per real evidence that
+            # LESS restriction (routed11) beat MORE restriction (routed16, fully frozen).
+            backbone_scale = PER_ARM_BACKBONE_LR_SCALE.get(arm, BET_BACKBONE_LR_SCALE)
             opt = torch.optim.AdamW([
                 {"params": new_params, "lr_scale": 1.0},
-                {"params": old_params, "lr_scale": BET_BACKBONE_LR_SCALE},
+                {"params": old_params, "lr_scale": backbone_scale},
             ], lr=LR)
         else:
             # routed15 (control): no new module - every param gets the SAME BET_BACKBONE_LR_SCALE
@@ -767,9 +777,10 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
-    elif arm in ("routed22", "routed23"):
-        # from scratch, plain (non-upweighted) mixture - routed22 isolates whether copy-gate
-        # needs a warm-started backbone at all; routed23 isolates the alignment loss alone.
+    elif arm in ("routed22", "routed23", "routed24"):
+        # plain (non-upweighted) mixture, matching routed11 exactly for routed24 - routed22
+        # isolates whether copy-gate needs a warm-started backbone at all; routed23 isolates
+        # the alignment loss alone; routed24 isolates backbone plasticity (see _build_model).
         loader = iter(_ld(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm in ("routed", "pooled", "pooled2", "hybrid", "routed2", "routed5", "routed7", "routed8") + BET_ARMS:
         loader = iter(_ld(PackedRoutedStream(bundle, domain_index, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))

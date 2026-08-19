@@ -256,6 +256,7 @@ NEW_MODULE_MATCH = {
     "routed16": ("copy_q.", "copy_k.", "copy_gate."),  # same mechanism, but see FROZEN_BACKBONE_ARMS
     "routed20": ("copy_q.", "copy_k.", "copy_gate."),  # same LR treatment as routed11 - see ALIGN_ARMS
     "routed21": ("copy_q.", "copy_k.", "copy_gate."),  # routed20's no-alignment control
+    "routed24": ("copy_q.", "copy_k.", "copy_gate."),  # routed11's exact recipe, rerun fresh - see ALIGN_ARMS
 }
 
 # routed7 (extended) and routed8 target ~600,000 steps rather than the usual 150,000. At
@@ -290,11 +291,23 @@ WARM_START_PARENT = {
     # new thing being learned during continuation (mixture stays 70% nlp throughout, it doesn't
     # have to be picked up from scratch at the same time as the new module). routed22/23
     # deliberately absent - from scratch, no parent at all.
+    "routed24": "routed8",  # routed11's EXACT parent - see PER_ARM_BACKBONE_LR_SCALE below
 }
 COOLDOWN_STEPS = 50000  # ~1/3 of a full run - cheap, and the backbone is already trained
 COOLDOWN_BACKBONE_LR_SCALE = 0.1  # warm-started params (everything but nlp) train 10x slower
                                     # than the freshly-reinitialized nlp branch, so the cooldown
                                     # doesn't undo what the parent checkpoint already learned
+
+# routed24: the "amp it up" version of routed11, not a plain rerun. Real evidence from
+# tonight's re-scoring: routed16 (FROZEN backbone, 0x plasticity) lost to routed11
+# (throttled at BET_BACKBONE_LR_SCALE=0.3, i.e. NOT frozen) on every metric - so the trend
+# so far is "more backbone plasticity helped, not hurt." routed24 tests the natural next
+# point on that same axis: full, UNTHROTTLED backbone LR (1.0, no throttle at all) instead
+# of 0.3x, same parent (routed8) and same unbiased gate init as routed11 - isolating
+# backbone-plasticity as the one lever being pushed further, not conflated with diet or
+# alignment (those are routed20/21/23's job). Launch longer than routed11's original
+# BET_STEPS too (150k vs 100k) since routed11 showed no sign of saturating.
+PER_ARM_BACKBONE_LR_SCALE = {"routed24": 1.0}  # overrides BET_BACKBONE_LR_SCALE for this arm only
 
 # routed20/21/22/23: the four-way ablation launched the night evaluate_lambada's copy-gate
 # measurement bug was found and fixed (see mot_routed_copygate_model.py). Two real, newly-

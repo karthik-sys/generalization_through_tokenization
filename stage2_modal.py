@@ -807,7 +807,8 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
         tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
         nlp_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp"
                             if arm in ("routed7", "routed8", "routed11", "routed12", "routed13", "routed14",
-                                        "routed15", "routed16", "routed17", "routed18", "routed19") else
+                                        "routed15", "routed16", "routed17", "routed18", "routed19",
+                                        "routed20", "routed21", "routed22", "routed23", "routed24") else
                             (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None)),
     )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
@@ -815,12 +816,14 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4",
                              "routed7", "routed8", "routed9", "routed10", "routed11", "routed12", "routed13", "routed14",
-                             "routed15", "routed16", "routed17", "routed18", "routed19")
+                             "routed15", "routed16", "routed17", "routed18", "routed19",
+                             "routed20", "routed21", "routed22", "routed23", "routed24")
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    elif arm in ("routed", "routed7", "routed8", "routed9", "routed10", "routed15", "routed17", "routed18", "routed19"):
+    elif arm in ("routed", "routed7", "routed8", "routed9", "routed10", "routed15", "routed17", "routed18",
+                 "routed19", "routed23"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    elif arm in ("routed11", "routed14", "routed16"):
+    elif arm in ("routed11", "routed14", "routed16", "routed20", "routed21", "routed22", "routed24"):
         model = MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "routed12":
         model = MoTRoutedDeepExpertModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
@@ -1078,7 +1081,8 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
         tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
         nlp_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp"
                             if arm in ("routed7", "routed8", "routed11", "routed12", "routed13", "routed14",
-                                        "routed15", "routed16", "routed17", "routed18", "routed19") else
+                                        "routed15", "routed16", "routed17", "routed18", "routed19",
+                                        "routed20", "routed21", "routed22", "routed23", "routed24") else
                             (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None)),
     )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
@@ -1086,12 +1090,14 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     domain_routed = arm in ("mot", "routed", "pooled", "hybrid", "pooled2", "routed2", "routed3", "routed4",
                              "routed7", "routed8", "routed9", "routed10", "routed11", "routed12", "routed13", "routed14",
-                             "routed15", "routed16", "routed17", "routed18", "routed19")
+                             "routed15", "routed16", "routed17", "routed18", "routed19",
+                             "routed20", "routed21", "routed22", "routed23", "routed24")
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    elif arm in ("routed", "routed7", "routed8", "routed9", "routed10", "routed15", "routed17", "routed18", "routed19"):
+    elif arm in ("routed", "routed7", "routed8", "routed9", "routed10", "routed15", "routed17", "routed18",
+                 "routed19", "routed23"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
-    elif arm in ("routed11", "routed14", "routed16"):
+    elif arm in ("routed11", "routed14", "routed16", "routed20", "routed21", "routed22", "routed24"):
         model = MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "routed12":
         model = MoTRoutedDeepExpertModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
