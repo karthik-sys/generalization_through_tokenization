@@ -42,6 +42,7 @@ from src.model.mot_routed_copygate_model import MoTRoutedCopyGateModel
 from src.model.mot_routed_decoupled_model import MoTRoutedDecoupledModel
 from src.model.mot_routed_deepexpert_model import DEFAULT_N_EXPERT_LAYERS, MoTRoutedDeepExpertModel
 from src.model.mot_routed_model import MoTRoutedModel
+from src.model.mot_routed_tied_model import MoTRoutedTiedModel
 from src.model.mot_routed_precision_model import MoTRoutedPrecisionModel
 from src.model.stage2_config import (
     ADV_LAMBDA_RAMP_STEPS, ALIGN_ARMS, ALIGN_LOSS_EVERY, ALIGN_LOSS_WEIGHT, ARM_LABELS,
@@ -70,8 +71,8 @@ DIET_ARMS = ("routed17", "routed18")  # round-2 data-lever arms: force_domain="n
 # model(tok, dom, ctrl, targets=tgt, ...) call); RECIPE_DIET_ARMS is the subset using the
 # diet (nlp-upweighted) loader rather than the plain one.
 RECIPE_ARMS = ("routed20", "routed21", "routed22", "routed23", "routed24",
-                "routed25", "routed26", "routed27", "routed28")
-RECIPE_DIET_ARMS = ("routed20", "routed21", "routed25", "routed26", "routed27", "routed28")
+                "routed25", "routed26", "routed27", "routed28", "routed29")
+RECIPE_DIET_ARMS = ("routed20", "routed21", "routed25", "routed26", "routed27", "routed28", "routed29")
 OWT_TOKENIZER_ARMS = ("routed7", "routed8", "routed19") + BET_ARMS + DIET_ARMS + RECIPE_ARMS  # everything
 # sourcing nlp from OpenWebText with routed8's own OWT-fit tokenizer (routed9/10 use PG-19 books instead)
 
@@ -369,6 +370,14 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
         # routed16's -4.0 "conservative" one - the conservative init underperformed once
         # correctly measured, so there's no reason to carry it into this set).
         return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    if arm == "routed29":
+        # tied-head reallocation (see mot_routed_tied_model.py + TIED_MODEL_CFG in
+        # stage2_config.py): same gate+diet recipe as routed25/26/27, but the ~50M normally
+        # spent on 4 untied output heads is reinvested as backbone depth (23 layers at
+        # MODEL_CFG's d_model=512, vs 6) instead. From scratch - no compatible warm-start
+        # checkpoint exists for this architecture (head/embedding shapes differ structurally).
+        from src.model.stage2_config import TIED_MODEL_CFG
+        return MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **TIED_MODEL_CFG).to(device)
     if arm == "routed16":  # Bet 1 v2: same mechanism, conservative gate init (see routed11/14 post-mortem)
         return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
                                        gate_bias_init=COPYGATE_V2_BIAS_INIT).to(device)
@@ -1091,7 +1100,7 @@ if __name__ == "__main__":
                                   "routed8", "routed9", "routed10", "routed11", "routed12", "routed13",
                                   "routed14", "routed15", "routed16", "routed17", "routed18", "routed19",
                                   "routed20", "routed21", "routed22", "routed23", "routed24",
-                                  "routed25", "routed26", "routed27", "routed28"])
+                                  "routed25", "routed26", "routed27", "routed28", "routed29"])
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--scale", choices=["base", "large"], default="base",
                          help="'large' (mot/baseline only) uses LARGE_MODEL_CFG for the scale test")

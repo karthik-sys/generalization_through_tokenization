@@ -31,6 +31,17 @@ BACKBONE_ONLY_CFG = {k: v for k, v in MODEL_CFG.items() if k != "emb_dim"}
 LARGE_MODEL_CFG = dict(emb_dim=192, d_model=768, n_heads=12, ffn_dim=3072, n_layers=12, max_seq_len=1024)
 LARGE_BACKBONE_ONLY_CFG = {k: v for k, v in LARGE_MODEL_CFG.items() if k != "emb_dim"}
 
+# routed29: reallocates params rather than adding them (MoTRoutedTiedModel - see that file's
+# docstring). At MODEL_CFG's dims, the 4 output heads cost ~55.5M/89.1M (62%) with zero
+# sharing against the embeddings they mirror. Tying each head to its own domain's embedding
+# (GPT-2's trick, bridged via a small per-domain Linear since our emb_dim != d_model) frees
+# ~48-50M, reinvested here as backbone depth: 23 layers at the SAME d_model=512/ffn=2048 as
+# MODEL_CFG (vs MODEL_CFG's 6 layers, and deeper than even LARGE_MODEL_CFG's 12) - lands at
+# 88.06M total, within 1.2% of MODEL_CFG's 89.1M, with backbone now 82.9% of the model
+# instead of 21.8%. From scratch only - no warm-start parent exists for this architecture
+# (head/embedding shapes are structurally incompatible with every existing checkpoint).
+TIED_MODEL_CFG = dict(emb_dim=128, d_model=512, n_heads=8, ffn_dim=2048, n_layers=23, max_seq_len=1024)
+
 # arm="routed6" only: plain MoTRoutedModel at 2x context (1024->2048), nothing else changed -
 # more room between switches for the model to re-establish domain state, without touching
 # loss weighting at all (unlike routed2/3/hybrid, which all failed by that route).
