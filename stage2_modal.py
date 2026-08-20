@@ -630,7 +630,9 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
 
     os.chdir("/root/repo")
     import itertools
+    import json
     import math
+    from pathlib import Path
 
     import torch
     import torch.nn.functional as F
@@ -701,8 +703,8 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     elif arm in ("routed31", "routed32"):
         MODEL_CFG = ROUTED_MODERN_MODEL_CFG  # RoPE/RMSNorm(+SwiGLU/QK-norm for routed31 only)
         STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
-    elif arm == "routed33":
-        MODEL_CFG = LARGE_MODEL_CFG  # 5-domain generalist, large scale, from scratch
+    elif arm in ("routed33", "routed35"):
+        MODEL_CFG = LARGE_MODEL_CFG  # 5-domain generalist, large scale (routed33 from scratch, routed35 warm-started from routed28@140k)
         scale = "large"
         STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
     elif scale == "large":
@@ -890,9 +892,9 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
                                         "routed15", "routed16", "routed17", "routed18", "routed19",
                                         "routed20", "routed21", "routed22", "routed23", "routed24",
                                         "routed25", "routed26", "routed27", "routed28", "routed29",
-                                        "routed31", "routed32", "routed33") else
+                                        "routed31", "routed32", "routed33", "routed35") else
                             (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None))),
-        generalist_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_generalist/generalist" if arm == "routed33" else None),
+        generalist_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_generalist/generalist" if arm in ("routed33", "routed35") else None),
     )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
@@ -902,14 +904,14 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
                              "routed15", "routed16", "routed17", "routed18", "routed19",
                              "routed20", "routed21", "routed22", "routed23", "routed24",
                              "routed25", "routed26", "routed27", "routed28",
-                             "routed29", "routed30", "routed31", "routed32", "routed33")
+                             "routed29", "routed30", "routed31", "routed32", "routed33", "routed35")
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed", "routed7", "routed8", "routed9", "routed10", "routed15", "routed17", "routed18",
                  "routed19", "routed23"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed11", "routed14", "routed16", "routed20", "routed21", "routed22", "routed24",
-                 "routed25", "routed26", "routed27", "routed28", "routed33"):
+                 "routed25", "routed26", "routed27", "routed28", "routed33", "routed35"):
         model = MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed29", "routed30"):
         model = MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
@@ -953,7 +955,33 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     LN2 = math.log(2)
     seq_len = MODEL_CFG["max_seq_len"]
 
+    # bytes-per-token is a property of (arm's tokenizer, domain, noisy-flag) alone - it never
+    # changes across checkpoints of the same arm, but every eval call used to recompute it from
+    # scratch (150 fresh HF document reads per domain), the single biggest chunk of eval wall
+    # time behind the batch-4/no-prefetch DataLoaders below. Cached to the volume so the SAME
+    # arm's later checkpoints (every arm gets evaluated at 3-5+ checkpoints in practice) hit a
+    # dict lookup instead of a live HF stream. Keyed by (arm, domain, noisy) rather than by
+    # tokenizer identity directly - simpler and always correct, at the cost of not sharing a
+    # cache entry between two different arms that happen to use an identical tokenizer for the
+    # same domain (a real but much smaller loss than the per-checkpoint redundancy this fixes).
+    _BPT_CACHE_PATH = Path(VOLUME_PATH) / "bpt_cache.json"
+    volume.reload()  # pick up cache entries written by other eval containers (see checkpoint-discovery's own use of this above)
+    try:
+        _bpt_cache = json.loads(_BPT_CACHE_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        # JSONDecodeError covers a rare concurrent-write race (two eval calls landing at once) -
+        # this is a pure performance cache, so falling back to "recompute this one" is the
+        # right failure mode, not crashing the whole eval on a torn read of a non-critical file.
+        _bpt_cache = {}
+
+    def _bpt_cache_save():
+        _BPT_CACHE_PATH.write_text(json.dumps(_bpt_cache))
+        volume.commit()
+
     def bpt_domain(domain: str, n_docs: int = 150) -> float:
+        key = f"{arm}:{domain}:{noisy}"
+        if key in _bpt_cache:
+            return _bpt_cache[key]
         gen = held_out_doc_stream(domain, noisy)
         tot_b, tot_t = 0, 0
         for _ in range(n_docs):
@@ -961,16 +989,25 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
             tot_b += len(text.encode("utf-8"))
             ids, _ = bundle.encode_domain(domain, text, max_len=10**9)
             tot_t += len(ids)
-        return tot_b / max(tot_t, 1)
+        bpt = tot_b / max(tot_t, 1)
+        _bpt_cache[key] = bpt
+        _bpt_cache_save()
+        return bpt
 
     def bpt_global(encode_fn, n_docs: int = 150) -> float:
+        key = f"{arm}:__global__:{noisy}"
+        if key in _bpt_cache:
+            return _bpt_cache[key]
         gens = [held_out_doc_stream(d, noisy) for d in STREAM_SOURCES]
         tot_b, tot_t = 0, 0
         for i in range(n_docs):
             text = next(gens[i % len(gens)])
             tot_b += len(text.encode("utf-8"))
             tot_t += len(encode_fn(text, max_len=10**9))
-        return tot_b / max(tot_t, 1)
+        bpt = tot_b / max(tot_t, 1)
+        _bpt_cache[key] = bpt
+        _bpt_cache_save()
+        return bpt
 
     mode = "NOISY (8% char-corruption)" if noisy else "clean"
 
@@ -985,7 +1022,14 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
         nats = {d: 0.0 for d in domains}
         toks = {d: 0 for d in domains}
         loaders = {
-            d: iter(DataLoader(HeldOutDomainStream(d, bundle.encode_domain, seq_len, noisy), batch_size=BATCH_SIZE))
+            # num_workers>0 tried and reverted: HeldOutDomainStream reads through a .skip()'d
+            # HF IterableDataset (SkipExamplesIterable), which doesn't implement
+            # shard_data_sources - PyTorch's DataLoader calls that unconditionally for ANY
+            # num_workers>0 (even 1, no actual sharding needed), so it hard-crashes rather
+            # than silently misbehaving. Confirmed live against a real Modal eval before this
+            # revert. pin_memory alone (no workers) is still a real, safe win for the H2D copy.
+            d: iter(DataLoader(HeldOutDomainStream(d, bundle.encode_domain, seq_len, noisy), batch_size=BATCH_SIZE,
+                                pin_memory=True))
             for d in domains
         }
         with torch.no_grad():
@@ -1041,7 +1085,8 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
             cd_nats, cd_toks = {d: 0.0 for d in domains}, {d: 0 for d in domains}
             switch_correct, switch_total = 0, 0
             cd_loader = iter(DataLoader(
-                HeldOutRoutedStream(bundle, domain_index, seq_len, noisy), batch_size=BATCH_SIZE))
+                HeldOutRoutedStream(bundle, domain_index, seq_len, noisy), batch_size=BATCH_SIZE,
+                pin_memory=True))
             with torch.no_grad():
                 for i in range(eval_batches):
                     tok, dom, ctrl, typ, tgt = next(cd_loader)
@@ -1079,7 +1124,8 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
         encode_fn = bundle.encode_baseline if arm == "baseline" else bundle.encode_sota
         bpt = bpt_global(encode_fn)
         total_nats, total_toks = 0.0, 0
-        loader = iter(DataLoader(HeldOutMixedStream(encode_fn, seq_len, noisy), batch_size=BATCH_SIZE))
+        loader = iter(DataLoader(HeldOutMixedStream(encode_fn, seq_len, noisy), batch_size=BATCH_SIZE,
+                                  pin_memory=True))
         with torch.no_grad():
             for i in range(eval_batches):
                 ids = next(loader).to(device)
@@ -1183,7 +1229,7 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
         MODEL_CFG = ROUTED30_MODEL_CFG
     elif arm in ("routed31", "routed32"):
         MODEL_CFG = ROUTED_MODERN_MODEL_CFG
-    elif arm == "routed33":
+    elif arm in ("routed33", "routed35"):
         MODEL_CFG = LARGE_MODEL_CFG
         scale = "large"
     elif scale == "large":
@@ -1199,9 +1245,9 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
                                         "routed15", "routed16", "routed17", "routed18", "routed19",
                                         "routed20", "routed21", "routed22", "routed23", "routed24",
                                         "routed25", "routed26", "routed27", "routed28", "routed29",
-                                        "routed31", "routed32", "routed33") else
+                                        "routed31", "routed32", "routed33", "routed35") else
                             (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None))),
-        generalist_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_generalist/generalist" if arm == "routed33" else None),
+        generalist_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_generalist/generalist" if arm in ("routed33", "routed35") else None),
     )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
@@ -1211,14 +1257,14 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
                              "routed15", "routed16", "routed17", "routed18", "routed19",
                              "routed20", "routed21", "routed22", "routed23", "routed24",
                              "routed25", "routed26", "routed27", "routed28",
-                             "routed29", "routed30", "routed31", "routed32", "routed33")
+                             "routed29", "routed30", "routed31", "routed32", "routed33", "routed35")
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed", "routed7", "routed8", "routed9", "routed10", "routed15", "routed17", "routed18",
                  "routed19", "routed23"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed11", "routed14", "routed16", "routed20", "routed21", "routed22", "routed24",
-                 "routed25", "routed26", "routed27", "routed28", "routed33"):
+                 "routed25", "routed26", "routed27", "routed28", "routed33", "routed35"):
         model = MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed29", "routed30"):
         model = MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
