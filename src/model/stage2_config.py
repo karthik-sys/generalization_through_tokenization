@@ -152,6 +152,40 @@ STREAM_SOURCES = {
     "science": {"path": "gfissore/arxiv-abstracts-2021", "name": None, "gated": False},
     "nlp": {"path": "HuggingFaceFW/fineweb", "name": "sample-10BT", "gated": False},
 }
+
+# routed34/36 (and any future FWE/edu-data arm): weighted multi-source blends for the
+# nlp/math/science domains, per the GPT-2-budget data spec. Each entry is (source_dict,
+# weight) using the SAME {"path", "name", "gated", ...} shape as STREAM_SOURCES itself, so a
+# blend list can be consumed by the same loading path with an extra weighted-choice step.
+# All three domains keep code unchanged (codeparrot, above) - only nlp/math/science are
+# reblended. Meant to be pre-tokenized to shards (scripts/build_token_shards.py), not streamed
+# live - see that script's own docstring for why (nlpbranch's pipeline-bound throughput was
+# the live warning sign).
+FWE_NLP_SOURCES = [
+    ({"path": "HuggingFaceFW/fineweb-edu", "name": "sample-100BT", "gated": False}, 0.60),
+    ({"path": "Skylion007/openwebtext", "name": None, "gated": False}, 0.40),
+]
+EDU_MATH_SOURCES = [
+    ({"path": "open-web-math/open-web-math", "name": None, "gated": False}, 0.45),
+    ({"path": "HuggingFaceTB/cosmopedia", "name": "auto_math_text", "gated": False}, 0.35),
+    ({"path": "HuggingFaceTB/cosmopedia", "name": "khanacademy", "gated": False}, 0.20),
+]
+EDU_SCIENCE_SOURCES = [
+    ({"path": "HuggingFaceTB/cosmopedia", "name": "openstax", "gated": False}, 0.40),
+    ({"path": "HuggingFaceTB/cosmopedia", "name": "stanford", "gated": False}, 0.25),
+    # fineweb-edu filtered through src/data/domain_classifier.py -> science. Weight moves to
+    # openstax (0.40 -> 0.60) if the classifier pass proves too slow to run once over the
+    # target token budget - a launch-time fallback, not a design uncertainty.
+    ({"path": "HuggingFaceFW/fineweb-edu", "name": "sample-100BT", "gated": False,
+      "domain_filter": "science"}, 0.20),
+    ({"path": "gfissore/arxiv-abstracts-2021", "name": None, "gated": False}, 0.15),
+]
+
+# Long-doc fraction (routed34/35/36/37, per routed19's own law: constant from step 1, no
+# staging): this share of synthetic docs are pure single-domain at LONG_DOC_SNIPPET_WORDS
+# instead of the normal spliced multi-domain composition. Decided at launch, not tuned mid-run.
+LONG_DOC_FRACTION = 0.20
+LONG_DOC_SNIPPET_WORDS = 2500
 # Human-readable labels for the five training arms. The short keys (mot/baseline/sota/
 # routed/pooled) are load-bearing - they're embedded in checkpoint filenames that the live
 # runs write and auto-resume from, so they must NOT be renamed mid-flight. These labels are
