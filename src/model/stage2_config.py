@@ -508,6 +508,15 @@ ROUTED19_PHASE2_CACHE_PASS_OFFSET = 10_000
 ROUTED19_BATCH_SIZE = 32
 ROUTED19_GRAD_ACCUM_STEPS = 2  # 32 * 2 = 64, same effective batch as everywhere else
 
+# nlpbranch + the final-four batch (routed34-37): same reasoning/precedent as routed19's own
+# batch/accum override above - domain-routed arms with per-domain vocabs (~30-40k), not sota's
+# 100k shared vocab, so they don't need BATCH_SIZE kept small for logits-tensor headroom.
+# Reused (not duplicated) across every arm in this batch since they're all domain-routed at
+# base or large scale. Effective batch stays 64, so LR schedule/token-per-step math is
+# unchanged - this only changes wall-clock/cost, never what's mathematically being trained.
+FAST_BATCH_SIZE = 32
+FAST_GRAD_ACCUM_STEPS = 2  # 32 * 2 = 64
+
 ROUTED3_MIN_DOMAINS = 4
 ROUTED3_MAX_DOMAINS = 4
 ROUTED3_SNIPPET_WORDS = 100

@@ -50,6 +50,7 @@ from src.model.stage2_config import (
     BACKBONE_ONLY_CFG, BATCH_SIZE, BET_BACKBONE_LR_SCALE,
     BOOKS_NLP_UPWEIGHT_SNIPPET_WORDS, CHECKPOINT_EVERY, CONFIDENCE_WEIGHT, COOLDOWN_BACKBONE_LR_SCALE,
     COPY_MINE_MIN_GAP, COPY_MINE_MIN_WORD_LEN, COPYGATE_V2_BIAS_INIT, DIET_PHASE2_NLP_SNIPPET_WORDS,
+    FAST_BATCH_SIZE, FAST_GRAD_ACCUM_STEPS,
     FOCAL_GAMMA, FROZEN_BACKBONE_ARMS, GRAD_ACCUM_STEPS, HYBRID_NATURAL_DATA_FRACTION, LOG_EVERY,
     LONGCTX_MODEL_CFG, LR, MAX_STEPS, MODEL_CFG, NEW_MODULE_MATCH, PER_ARM_BACKBONE_LR_SCALE,
     ROUTED3_MAX_DOMAINS,
@@ -64,6 +65,10 @@ BET_ARMS = ("routed11", "routed12", "routed13", "routed14", "routed15", "routed1
 # copy-gate, deep-experts, precision-head, scaled-up copy-gate, control, copy-gate-v2-frozen -
 # all use bare PackedRoutedStream + the NEW_MODULE_MATCH-driven differential-LR path.
 LARGE_BET_ARMS = ("routed14", "routed28", "routed33", "routed35")  # subset that forces scale="large" (see _build_model)
+FAST_SETTINGS_ARMS = ("nlpbranch",)  # micro-batch 32/accum 2 (FAST_BATCH_SIZE/FAST_GRAD_ACCUM_STEPS)
+# instead of the global BATCH_SIZE(4)/GRAD_ACCUM_STEPS(16) - same effective batch (64), same
+# precedent/reasoning as routed19's own override (see ROUTED19_BATCH_SIZE's comment in
+# stage2_config.py). Extend this tuple as routed34/36/37 get built.
 DIET_ARMS = ("routed17", "routed18")  # round-2 data-lever arms: force_domain="nlp" upweighting,
 # same mechanism as routed9/10 but no reinit (nlp-vs-rest differential LR via WARM_START_PARENT)
 # routed20/21/22/23: the copy-gate-fix-night four-way ablation (see ALIGN_ARMS's comment block
@@ -578,8 +583,9 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
     # calibrate's memory profile matches what the real run will actually use - calibrate()
     # doesn't accumulate gradients at all (opt.step() every micro-step), so this only matters
     # for getting a representative peak-memory reading, not for timing per real optimizer update.
-    if arm == "routed19":
-        calib_grad_accum = 1 if world_size > 1 else ROUTED19_GRAD_ACCUM_STEPS
+    if arm == "routed19" or arm in FAST_SETTINGS_ARMS:
+        base_accum = ROUTED19_GRAD_ACCUM_STEPS if arm == "routed19" else FAST_GRAD_ACCUM_STEPS
+        calib_grad_accum = 1 if world_size > 1 else base_accum
         routed19_batch_size = 64 // calib_grad_accum
     if arm in ("routed7", "routed10") + LARGE_BET_ARMS:
         scale = "large"  # always large-scale, regardless of what --scale was passed
@@ -670,7 +676,7 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
         # path uses), not PackedRoutedStream. Recast to the model's (tok, dom, ctrl, typ, tgt)
         # shape happens per-batch in the main loop below (same recast _hybrid_batch's natural
         # path already does), since PackedDomainStream doesn't yield that shape directly.
-        loader = iter(_ld(PackedDomainStream("nlp", bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_ld(PackedDomainStream("nlp", bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=routed19_batch_size))
     elif arm in ("routed22", "routed23", "routed24"):
         # plain (non-upweighted) mixture, matching routed11 exactly for routed24 - routed22
         # isolates whether copy-gate needs a warm-started backbone at all; routed23 isolates
@@ -785,9 +791,10 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     #    longer needed to keep any single device's batch small. At 4 GPUs this gives
     #    micro-batch=16, not 8 - genuinely bigger per-step work, simpler code (every step is a
     #    sync step, no no_sync() branch), same real optimizer-update count either way.
-    if arm == "routed19":
+    if arm == "routed19" or arm in FAST_SETTINGS_ARMS:
         designed_effective_batch = 64
-        grad_accum = 1 if world_size > 1 else ROUTED19_GRAD_ACCUM_STEPS
+        base_accum = ROUTED19_GRAD_ACCUM_STEPS if arm == "routed19" else FAST_GRAD_ACCUM_STEPS  # both 2, kept separate for clarity/provenance
+        grad_accum = 1 if world_size > 1 else base_accum
         routed19_batch_size = designed_effective_batch // grad_accum  # world_size division
         # happens inside _ld itself (see _loader) - passing this un-divided value through is
         # deliberate, not a bug: (64//grad_accum) // world_size == 64/(grad_accum*world_size).
@@ -1037,7 +1044,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         # path uses), not PackedRoutedStream. Recast to the model's (tok, dom, ctrl, typ, tgt)
         # shape happens per-batch in the main loop below (same recast _hybrid_batch's natural
         # path already does), since PackedDomainStream doesn't yield that shape directly.
-        loader = iter(_ld(PackedDomainStream("nlp", bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
+        loader = iter(_ld(PackedDomainStream("nlp", bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=routed19_batch_size))
     elif arm in ("routed22", "routed23", "routed24"):
         # plain (non-upweighted) mixture, matching routed11 exactly for routed24 - routed22
         # isolates whether copy-gate needs a warm-started backbone at all; routed23 isolates
@@ -1107,7 +1114,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                                          DIET_PHASE2_NLP_SNIPPET_WORDS if diet_upweighted else None),
             force_domain_filter=(COPY_MINE_MIN_WORD_LEN, COPY_MINE_MIN_GAP) if arm == "routed18" else None,
         )
-        val_iter = iter(_ld(val_stream, batch_size=routed19_batch_size if arm == "routed19" else BATCH_SIZE))
+        val_iter = iter(_ld(val_stream, batch_size=routed19_batch_size if (arm == "routed19" or arm in FAST_SETTINGS_ARMS) else BATCH_SIZE))
 
     def _held_out_ce():
         model.eval()
