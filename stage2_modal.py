@@ -975,7 +975,11 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     mode = "NOISY (8% char-corruption)" if noisy else "clean"
 
     if domain_routed:
-        domains = list(bundle.domain_vocab_sizes)
+        # routed33's "generalist" domain has no external source of its own (it's a synthetic
+        # pool of the other 4 domains, see build_generalist_cache) - there's no genuinely
+        # held-out generalist text to live-stream, so it's excluded from single-domain BPB
+        # rather than KeyError on a STREAM_SOURCES lookup that was never meant to exist for it.
+        domains = [d for d in bundle.domain_vocab_sizes if d in STREAM_SOURCES]
         # mot/routed/pooled share the same per-domain tokenizers, so bytes-per-token is shared
         bpt = {d: bpt_domain(d) for d in domains}
         nats = {d: 0.0 for d in domains}
