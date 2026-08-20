@@ -536,6 +536,9 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
 
 
 def calibrate(arm: str, steps: int, scale: str = "base") -> float:
+    # Mirror train()'s TF32 setting so calibrate's timing is representative of a real run.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     rank, world_size, local_rank, device = _ddp_setup()
     is_main = rank == 0
     _ld = partial(_loader, world_size=world_size)
@@ -577,7 +580,7 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
         # for the forward/backward pass from here on, never for model-specific attributes.
         model = DDP(model, device_ids=[local_rank])
 
-    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-4, fused=True)
 
     if arm in ("mot", "hybrid"):
         domains = list(bundle.domain_vocab_sizes)
@@ -662,24 +665,24 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             _, ids, types = next(loaders[domain])
             ids, types = ids.to(device), types.to(device)
             inp, tgt = ids[:, :-1], ids[:, 1:]
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits = model(domain, inp, types[:, :-1])
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
         elif arm == "hybrid":
             tok, dom, ctrl, typ, tgt = _hybrid_batch(step, domains, domain_index, loaders, loader, device)
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
         elif arm in ("routed2", "routed3", "routed4"):
             # routed4 (combined: decoupled head + learned weight) takes no switch_weight
             # kwarg - it's an internal learned parameter, same call shape as routed2/routed3.
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
         elif arm in ("routed", "pooled", "pooled2", "routed5", "routed6", "routed7", "routed8", "routed9", "routed10") + BET_ARMS + DIET_ARMS + RECIPE_ARMS:
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 if arm in ("pooled", "pooled2"):
                     loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ,
                                      switch_weight=SWITCH_WEIGHT, adv_lambda=1.0)
@@ -689,12 +692,12 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             src = phase1_loader if step <= routed19_phase1_steps else phase2_loader
             tok, dom, ctrl, typ, tgt = next(src)
             tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
         else:
             ids = next(loader).to(device)
             inp, tgt = ids[:, :-1], ids[:, 1:]
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits = model(inp)
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
 
@@ -718,6 +721,11 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
 
 
 def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
+    # TF32 speeds up the remaining fp32 matmuls/convs (norm layers, optimizer math) outside
+    # the bf16-autocast regions above - free on Ampere+, no accuracy-relevant effect at the
+    # tolerances anything here is measured to.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     rank, world_size, local_rank, device = _ddp_setup()
     is_main = rank == 0
     _ld = partial(_loader, world_size=world_size)
@@ -795,7 +803,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         opt = torch.optim.AdamW([
             {"params": nlp_params, "lr_scale": 1.0},
             {"params": other_params, "lr_scale": COOLDOWN_BACKBONE_LR_SCALE},
-        ], lr=LR)
+        ], lr=LR, fused=True)
     elif arm in FROZEN_BACKBONE_ARMS:
         # routed16 (copy-gate v2): routed11/14's post-mortem found the copy mechanism itself
         # never hurt, but the shared backbone/vocab head degraded under the joint objective
@@ -810,7 +818,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                 trainable.append(p)
             else:
                 p.requires_grad_(False)
-        opt = torch.optim.AdamW(trainable, lr=LR)
+        opt = torch.optim.AdamW(trainable, lr=LR, fused=True)
     elif arm in NEW_MODULE_MATCH:
         match = NEW_MODULE_MATCH[arm]
         if match:
@@ -824,17 +832,19 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             opt = torch.optim.AdamW([
                 {"params": new_params, "lr_scale": 1.0},
                 {"params": old_params, "lr_scale": backbone_scale},
-            ], lr=LR)
+            ], lr=LR, fused=True)
         else:
             # routed15 (control): no new module - every param gets the SAME BET_BACKBONE_LR_SCALE
             # throttle routed11/12/13's non-new-module params got, so this is a genuine matched
             # control (identical warm-start + LR treatment, minus whatever each bet added).
-            opt = torch.optim.AdamW(model.parameters(), lr=LR)
+            opt = torch.optim.AdamW(model.parameters(), lr=LR, fused=True)
             for g in opt.param_groups:
                 g["lr_scale"] = BET_BACKBONE_LR_SCALE
     else:
-        opt = torch.optim.AdamW(model.parameters(), lr=LR)
-    scaler = torch.amp.GradScaler("cuda")
+        opt = torch.optim.AdamW(model.parameters(), lr=LR, fused=True)
+    # bf16 autocast (see the dtype= on every autocast block above) needs no loss scaling -
+    # unlike fp16, its exponent range covers fp32's without over/underflowing, so there's no
+    # GradScaler here (removed along with its scale/step/update calls below).
 
     CKPT_DIR.mkdir(exist_ok=True)
     ckpt_prefix = f"large_{arm}" if scale == "large" else arm  # keep large runs off base names
@@ -1029,7 +1039,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             for _ in range(VAL_BATCHES):
                 tok, dom, ctrl, typ, tgt = next(val_iter)
                 tok, dom, ctrl, typ, tgt = (t.to(device) for t in (tok, dom, ctrl, typ, tgt))
-                with torch.autocast("cuda"):
+                with torch.autocast("cuda", dtype=torch.bfloat16):
                     out = model(tok, dom, ctrl, targets=None, type_ids=typ)
                 for d in raw_model.domains:
                     if d not in out:
@@ -1056,7 +1066,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             _, ids, types = next(loaders[domain])
             ids, types = ids.to(device), types.to(device)
             inp, tgt = ids[:, :-1], ids[:, 1:]
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits = model(domain, inp, types[:, :-1])
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
         elif arm in ("routed", "routed7", "routed8", "routed9", "routed10") + BET_ARMS + DIET_ARMS + RECIPE_ARMS:
@@ -1070,7 +1080,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                     print(f"step {step}/{total_steps}  SKIPPED (no nlp tokens in window)", flush=True)
                 continue
             tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
             if arm in ALIGN_ARMS and step % ALIGN_LOSS_EVERY == 0:
                 # CORAL-style cross-domain embedding-table alignment (see domain_embedding_
@@ -1086,11 +1096,11 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             src = phase1_loader if step <= routed19_phase1_steps else phase2_loader
             tok, dom, ctrl, typ, tgt = next(src)
             tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
         elif arm == "hybrid":
             tok, dom, ctrl, typ, tgt = _hybrid_batch(step, domains, domain_index, loaders, loader, device)
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, parts = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
             controller_loss = parts["_content"]
         elif arm in ("routed2", "routed3", "routed4"):
@@ -1098,7 +1108,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             # parameter. Same call shape as routed2/routed3 otherwise.
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, parts = model(tok, dom, ctrl, targets=tgt, type_ids=typ)
             controller_loss = parts["_content"]
         elif arm in ("routed5", "routed6"):
@@ -1107,13 +1117,13 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             # controller_loss needed here.
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
         elif arm in ("pooled", "pooled2"):
             tok, dom, ctrl, typ, tgt = next(loader)
             tok, dom, ctrl, typ, tgt = (t.to(device, non_blocking=True) for t in (tok, dom, ctrl, typ, tgt))
             adv_lambda = min(1.0, step / max(1, ADV_LAMBDA_RAMP_STEPS))
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, parts = model(tok, dom, ctrl, targets=tgt, type_ids=typ,
                                      switch_weight=SWITCH_WEIGHT, adv_lambda=adv_lambda)
             main_parts = [v for k, v in parts.items() if not k.startswith("_")]
@@ -1121,7 +1131,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         else:
             ids = next(loader).to(device)
             inp, tgt = ids[:, :-1], ids[:, 1:]
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits = model(inp)
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
 
@@ -1156,7 +1166,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         sync_ctx = model.no_sync() if (world_size > 1 and not is_sync_step) else contextlib.nullcontext()
         try:
             with sync_ctx:
-                scaler.scale(loss / grad_accum).backward()
+                (loss / grad_accum).backward()
         except RuntimeError as e:
             # Belt-and-braces for FROZEN_BACKBONE_ARMS: the upstream domain-presence guard
             # (above) reduces how often a batch's loss ends up disconnected from every
@@ -1174,8 +1184,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         running += loss_val
         running_n += 1
         if is_sync_step:
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             opt.zero_grad()
 
         if controller is not None:
