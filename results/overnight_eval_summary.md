@@ -16,9 +16,11 @@ Checkpoints pulled from RunPod after an account-balance-triggered pod stop and m
 
 | Arm | Final step (of 300k) | LAMBADA EM | ppl | Single BPB | Cross BPB | Switch acc |
 |---|---|---|---|---|---|---|
-| **C (routed31)** — tied + RoPE + RMSNorm + SwiGLU + QK-norm | 94,000 (31%) | 17.60% | 8.05 | *pending* | *pending* | *pending* |
-| **D (routed32)** — tied + RoPE + RMSNorm only ("safe improver") | 222,000 (74%) | 16.60% | 7.89 | *pending* | *pending* | *pending* |
-| **routed33** — 5-domain generalist (untied, from scratch, aggressive nlp filter) | 210,000 (70%) | **18.00%** | **6.57** | *pending* | *pending* | *pending* |
+| **C (routed31)** — tied + RoPE + RMSNorm + SwiGLU + QK-norm | 94,000 (31%) | 17.60% | 8.05 | ~1.76 (half-sample, see note) | *unavailable* | *unavailable* |
+| **D (routed32)** — tied + RoPE + RMSNorm only ("safe improver") | 222,000 (74%) | 16.60% | 7.89 | *unavailable* — see note | *unavailable* | *unavailable* |
+| **routed33** — 5-domain generalist (untied, from scratch, aggressive nlp filter) | 210,000 (70%) | **18.00%** | **6.57** | 1.72 | 1.15 | 19.49% |
+
+**Note on missing C/D BPB numbers**: the final-checkpoint BPB eval for both C and D failed repeatedly (8 attempts for C, 5 for D) with a Modal-side `"Received a cancellation signal while processing input"` error — no Python traceback, so not a code bug in the usual sense. Ruled out as causes: local-client disconnect (fixed with `modal run --detach`, didn't help), log-streaming interference (removed, didn't help), launch concurrency (ran solo, still failed), and eval runtime length (cut `eval_batches` 200→80, still failed). routed33's BPB eval — architecturally simpler, no RoPE/SwiGLU/QK-norm — succeeded reliably twice on the same launch pattern, so the failure looks specific to the `MoTRoutedTiedModel` + `ModernBackbone` construction path, possibly an intermittent CUDA-level hang that Modal's worker health-check kills silently. C's single-domain BPB above is the running average from its best partial attempt (100/200 batches, i.e. real data but a half sample, ~±0.05 noisier than a full 200-batch read) — not a clean final number. D never got a partial reading; its most recent confirmed clean BPB remains the 138k checkpoint below. Worth a fresh look with eyes on `ModernBackbone`'s RoPE cache/memory footprint rather than more blind retries.
 
 Earlier checkpoints, for trend:
 
@@ -41,4 +43,4 @@ Earlier checkpoints, for trend:
 Cosine similarity between the main LM loss gradient and the switch-prediction loss gradient, on shared backbone params, 30 held-out batches: **mean -0.117, negative in 96.7% of batches** — real, consistent conflict. The switch-prediction auxiliary task is measurably fighting the main language-modeling objective for backbone capacity. Gradient surgery (dropping the conflicting component) is a real, untried next step.
 
 ---
-*Generated during the overnight session; will be updated as remaining BPB evals for C, D, and routed33 land.*
+*Generated during the overnight session. C and D's final-checkpoint BPB evals remain incomplete (see note above) — revisit if the Modal cancellation issue gets root-caused.*
