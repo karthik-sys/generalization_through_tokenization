@@ -17,6 +17,17 @@ Tracks infrastructure, eval-pipeline, and training-throughput changes — distin
 
 **Does not affect any currently-running arm** — these are process-level settings baked in at next launch, not retroactive. C/D/routed33 keep training on their original (pre-fix) settings for the rest of their run, by design — changing settings mid-flight would make their own before/after checkpoints non-comparable.
 
+#### Prospective savings (unconfirmed — projection, not a measurement)
+
+**Labeled explicitly as a guess so it can't be mistaken for the validated number above.** If the batch/accum lever (micro-batch 4→32, grad-accum 16→2) delivers anywhere near what the source throughput analysis predicted for it in isolation (2–4x) *and* that exposes bf16/TF32/fused's currently-invisible benefit as hypothesized, a combined **3–6x** on top of the current per-arm cost isn't an unreasonable range to expect — but every number in that range is a projection stacked on an unconfirmed mechanism, not something to spend against yet.
+
+| | Current (measured, no speedup) | If 3x (low end of projection) | If 6x (high end of projection) |
+|---|---|---|---|
+| 89M/300k-step arm | $19 / 44hrs | ~$6.30 / ~15hrs | ~$3.20 / ~7hrs |
+| large-scale arm | $35–40 / — | ~$12 / — | ~$6 / — |
+
+**Do not budget against this table.** It exists so that once the real combined benchmark lands (real `train()` loop, batch=32/accum=2 + bf16/TF32/fused together, converged over enough steps — not `calibrate()`), there's a clear "here's what we guessed vs. what we got" comparison, and the committed $200-week budget (`roadmap_2026-08-20.md`) updates from the actual result, not from this table. **Update this section, and only this section, once that run happens — don't let a real number get buried in prose the way the first one did.**
+
 ### RNG seed control added
 **Commit:** `5835c6f`
 
