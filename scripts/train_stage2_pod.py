@@ -1245,7 +1245,14 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--scale", choices=["base", "large"], default="base",
                          help="'large' (mot/baseline only) uses LARGE_MODEL_CFG for the scale test")
+    parser.add_argument("--seed", type=int, default=0,
+                         help="torch.manual_seed() for reproducible dropout/init/CUDA RNG - no arm "
+                              "launch controlled this before, so every 'replicate' to date varied by "
+                              "accident, not design. Same --seed across an old-vs-new settings pair is "
+                              "what makes a loss-parity check meaningful; a genuine seed replicate should "
+                              "pass a DIFFERENT --seed on purpose, not omit it.")
     args = parser.parse_args()
+    torch.manual_seed(args.seed)
 
     if args.mode == "calibrate":
         sec_per_step = calibrate(args.arm, args.steps or 150, scale=args.scale)
