@@ -76,7 +76,7 @@ RECIPE_ARMS = ("routed20", "routed21", "routed22", "routed23", "routed24",
                 "routed30", "routed31", "routed32", "routed33", "routed35")
 RECIPE_DIET_ARMS = ("routed20", "routed21", "routed25", "routed26", "routed27", "routed28", "routed29",
                      "routed30", "routed31", "routed32", "routed33", "routed35")
-OWT_TOKENIZER_ARMS = ("routed7", "routed8", "routed19") + BET_ARMS + DIET_ARMS + RECIPE_ARMS  # everything
+OWT_TOKENIZER_ARMS = ("routed7", "routed8", "routed19", "nlpbranch") + BET_ARMS + DIET_ARMS + RECIPE_ARMS  # everything
 # sourcing nlp from OpenWebText with routed8's own OWT-fit tokenizer (routed9/10 use PG-19 books instead)
 
 # Every DataLoader in this file used to default to num_workers=0 - synchronous, single-
@@ -522,6 +522,14 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
         return MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **ROUTED_MODERN_MODEL_CFG,
                                    backbone_cls=ModernBackbone,
                                    backbone_kwargs={"use_swiglu": False, "use_qk_norm": False}).to(device)
+    if arm == "nlpbranch":
+        # Exact same class/config as routed32 ("D"), including copy-gate active - branch-train-
+        # merge only works when every tensor averages shape-for-shape against the parent, so
+        # architecture must be byte-identical. Only the DATA and LR (see lr_at) differ.
+        from src.model.stage2_config import ROUTED_MODERN_MODEL_CFG
+        return MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **ROUTED_MODERN_MODEL_CFG,
+                                   backbone_cls=ModernBackbone,
+                                   backbone_kwargs={"use_swiglu": False, "use_qk_norm": False}).to(device)
     if arm == "routed16":  # Bet 1 v2: same mechanism, conservative gate init (see routed11/14 post-mortem)
         return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
                                        gate_bias_init=COPYGATE_V2_BIAS_INIT).to(device)
@@ -656,6 +664,13 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
+    elif arm == "nlpbranch":
+        # Branch-train-merge mini-experiment: PURE natural nlp, no synthetic switching at all -
+        # a single-domain PackedDomainStream (the same natural-text stream mot/hybrid's natural
+        # path uses), not PackedRoutedStream. Recast to the model's (tok, dom, ctrl, typ, tgt)
+        # shape happens per-batch in the main loop below (same recast _hybrid_batch's natural
+        # path already does), since PackedDomainStream doesn't yield that shape directly.
+        loader = iter(_ld(PackedDomainStream("nlp", bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm in ("routed22", "routed23", "routed24"):
         # plain (non-upweighted) mixture, matching routed11 exactly for routed24 - routed22
         # isolates whether copy-gate needs a warm-started backbone at all; routed23 isolates
@@ -919,6 +934,13 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             # WARM_START_PARENT's own "large_routed14"/"large_routed7" entries for the same
             # convention on every other large-scale parent.
             warm_started = _warm_start_routed33_generalist(model, "large_routed28", device, exact_step=140000)
+        elif arm == "nlpbranch":
+            # routed32 ("D") is base scale, not scale="large" (unlike routed28/33/35), so its
+            # checkpoint prefix is plain "routed32" - no "large_" prefix to account for here.
+            # skip_prefixes=() deliberately: identical architecture to the parent (same
+            # ROUTED_MODERN_MODEL_CFG, same backbone_kwargs, same tokenizer - see _build_model),
+            # so every tensor loads, nothing needs to be left at fresh init.
+            warm_started = _warm_start_from_parent(model, "routed32", device, skip_prefixes=())
         elif arm in WARM_START_PARENT:
             skip = _NLP_PARAM_PREFIXES if arm in ("routed9", "routed10") else ()
             warm_started = _warm_start_from_parent(model, WARM_START_PARENT[arm], device, skip_prefixes=skip)
@@ -951,6 +973,12 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         )
 
     def lr_at(step: int) -> float:
+        if arm == "nlpbranch":
+            # constant 0.1x peak (3e-5) - no warmup, no cosine decay. The parent (routed32@
+            # 300000) is already fully cosine-decayed; a hot restart at full LR would fling
+            # this branch out of the parent's weight-space basin, and weight-averaging two
+            # checkpoints only makes sense at modest divergence between them.
+            return 0.1
         if step < WARMUP_STEPS:
             return step / max(1, WARMUP_STEPS)
         progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
@@ -1003,6 +1031,13 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             bundle, domain_index, MODEL_CFG["max_seq_len"],
             force_domain="nlp", force_domain_snippet_words=DIET_PHASE2_NLP_SNIPPET_WORDS,
         ), batch_size=BATCH_SIZE))
+    elif arm == "nlpbranch":
+        # Branch-train-merge mini-experiment: PURE natural nlp, no synthetic switching at all -
+        # a single-domain PackedDomainStream (the same natural-text stream mot/hybrid's natural
+        # path uses), not PackedRoutedStream. Recast to the model's (tok, dom, ctrl, typ, tgt)
+        # shape happens per-batch in the main loop below (same recast _hybrid_batch's natural
+        # path already does), since PackedDomainStream doesn't yield that shape directly.
+        loader = iter(_ld(PackedDomainStream("nlp", bundle.encode_domain, MODEL_CFG["max_seq_len"]), batch_size=BATCH_SIZE))
     elif arm in ("routed22", "routed23", "routed24"):
         # plain (non-upweighted) mixture, matching routed11 exactly for routed24 - routed22
         # isolates whether copy-gate needs a warm-started backbone at all; routed23 isolates
@@ -1112,6 +1147,19 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits = model(domain, inp, types[:, :-1])
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
+        elif arm == "nlpbranch":
+            # loader yields raw PackedDomainStream nlp batches (ids, types), not the routed
+            # (tok, dom, ctrl, typ, tgt) shape - recast exactly like _hybrid_batch's natural
+            # path: dom constant (nlp for the whole window), ctrl all zero (no switches ever
+            # appear in this arm's data at all, not just probabilistically absent).
+            _, ids, types = next(loader)
+            ids, types = ids.to(device, non_blocking=True), types.to(device, non_blocking=True)
+            tok, tgt = ids[:, :-1], ids[:, 1:]
+            typ = types[:, :-1]
+            dom = torch.full_like(tok, domain_index["nlp"])
+            ctrl = torch.zeros_like(tok)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss, _ = model(tok, dom, ctrl, targets=tgt, type_ids=typ, switch_weight=SWITCH_WEIGHT)
         elif arm in ("routed", "routed7", "routed8", "routed9", "routed10") + BET_ARMS + DIET_ARMS + RECIPE_ARMS:
             tok, dom, ctrl, typ, tgt = next(loader)
             if arm in FROZEN_BACKBONE_ARMS and not (dom == domain_index["nlp"]).any():
@@ -1292,7 +1340,7 @@ if __name__ == "__main__":
                                   "routed14", "routed15", "routed16", "routed17", "routed18", "routed19",
                                   "routed20", "routed21", "routed22", "routed23", "routed24",
                                   "routed25", "routed26", "routed27", "routed28", "routed29",
-                                  "routed30", "routed31", "routed32", "routed33", "routed35"])
+                                  "routed30", "routed31", "routed32", "routed33", "routed35", "nlpbranch"])
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--scale", choices=["base", "large"], default="base",
                          help="'large' (mot/baseline only) uses LARGE_MODEL_CFG for the scale test")
