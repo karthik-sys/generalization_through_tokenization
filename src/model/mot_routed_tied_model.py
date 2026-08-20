@@ -48,8 +48,15 @@ class MoTRoutedTiedModel(nn.Module):
         gate_bias_init: float = 0.0,
         backbone_cls: type = Backbone,
         backbone_kwargs: dict | None = None,
+        use_copy_gate: bool = True,
     ):
         super().__init__()
+        # Every current tied-model arm (routed29-33) has trained with copy-gate active - it was
+        # never actually optional before this flag. Added for a post-hoc gateless ablation of
+        # whatever recipe wins the final-four batch ("is the gate still earning its keep at 10B
+        # tokens, once everything else is fixed"), not as a pre-launch control - see the
+        # session's own note on why routed35 couldn't be a genuine no-gate arm without this.
+        self.use_copy_gate = use_copy_gate
         self.domains = list(domain_vocab_sizes)
         self.domain_index = {d: i for i, d in enumerate(self.domains)}
         self.domain_vocab_sizes = dict(domain_vocab_sizes)
@@ -76,12 +83,13 @@ class MoTRoutedTiedModel(nn.Module):
         )
 
         # copy-gate (routed11/20/21/24/25's mechanism), nlp-only - see mot_routed_copygate_model.py
-        d_model_ = d_model
-        self.copy_q = nn.Linear(d_model_, d_model_)
-        self.copy_k = nn.Linear(d_model_, d_model_)
-        self.copy_gate = nn.Linear(d_model_, 1)
-        if gate_bias_init != 0.0:
-            nn.init.constant_(self.copy_gate.bias, gate_bias_init)
+        if self.use_copy_gate:
+            d_model_ = d_model
+            self.copy_q = nn.Linear(d_model_, d_model_)
+            self.copy_k = nn.Linear(d_model_, d_model_)
+            self.copy_gate = nn.Linear(d_model_, 1)
+            if gate_bias_init != 0.0:
+                nn.init.constant_(self.copy_gate.bias, gate_bias_init)
 
     def switch_target_index(self, from_domain: str, to_domain: str) -> int:
         return self.domain_vocab_sizes[from_domain] + self.domain_index[to_domain]
@@ -135,7 +143,7 @@ class MoTRoutedTiedModel(nn.Module):
                 mask = domain_ids == self.domain_index[domain]
                 if not mask.any():
                     continue
-                if domain == nlp and token_ids is not None and is_control is not None:
+                if domain == nlp and self.use_copy_gate and token_ids is not None and is_control is not None:
                     p_mix = self._nlp_copy_gate_pmix(h, domain_ids, is_control, token_ids)
                     out[domain] = (mask, torch.log(p_mix.clamp_min(1e-9)))
                 else:
@@ -152,7 +160,7 @@ class MoTRoutedTiedModel(nn.Module):
             mask = domain_ids == self.domain_index[domain]
             if not mask.any():
                 continue
-            if domain != nlp:
+            if domain != nlp or not self.use_copy_gate:
                 logits = self._domain_logits(h[mask], domain)
                 tgt = targets[mask]
                 per_pos_loss = F.cross_entropy(logits, tgt, reduction="none")

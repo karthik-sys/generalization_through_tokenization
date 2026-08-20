@@ -595,6 +595,12 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
     model = _build_model(arm, bundle, device, scale)
     if is_main:
         print(f"{arm} ({scale}) params: {model.num_params():,}", flush=True)
+    # Compile the backbone only, before DDP wrap - it's pure static tensor ops (no data-
+    # dependent branching) in both backbone classes, and is most of the FLOPs. The full routed
+    # model is NOT compiled: per-domain masked gathers + keep.any() branches in head_loss cause
+    # graph breaks/recompiles there. First 1-2 min of a run is compile time - judge throughput
+    # from step 300+, not step 1. If an arm graph-breaks, drop this one line for that arm only.
+    model.backbone = torch.compile(model.backbone)
     if world_size > 1:
         # DDP.__getattr__ does NOT forward arbitrary custom methods like num_params() to the
         # wrapped module the way it forwards forward() itself - only reference the DDP object
@@ -927,6 +933,13 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
     # .num_params()) - DDP does NOT forward arbitrary custom attributes to the wrapped module
     # the way it forwards forward()/.train()/.eval(), so using the DDP object for those would
     # either crash or silently do the wrong thing.
+    # Compile the backbone only, before raw_model/DDP - it's pure static tensor ops (no
+    # data-dependent branching) in both backbone classes, and is most of the FLOPs. The full
+    # routed model is NOT compiled: per-domain masked gathers + keep.any() branches in
+    # head_loss cause graph breaks/recompiles there. First 1-2 min of a run is compile time -
+    # judge throughput from step 300+, not step 1. If an arm graph-breaks, drop this one line
+    # for that arm only.
+    model.backbone = torch.compile(model.backbone)
     raw_model = model
     if world_size > 1:
         model = DDP(
@@ -1083,7 +1096,8 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         return tot_nats / max(tot_tok, 1)
 
     t0 = time.time()
-    running, running_n = 0.0, 0
+    # GPU tensor, not a Python float - see the running += loss.detach() comment below for why.
+    running, running_n = torch.zeros((), device=device), 0
     history = resumed_history
     for step in range(start_step, total_steps + 1):
         lr_mult = controller.lr_mult if controller is not None else 1.0
@@ -1179,14 +1193,22 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             # close to launch when this is a one-line, correctness-only addition.
             loss = loss + 0.0 * sum(p.sum() for p in raw_model.parameters())
 
-        loss_val = loss.item()
-        controller_loss_val = float(controller_loss) if arm in ("pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4") else loss_val
-        if controller is not None and controller.should_skip(loss_val):
-            opt.zero_grad()
-            if step % LOG_EVERY == 0:
-                print(f"step {step}/{total_steps}  SKIPPED (loss={loss_val:.3f}, "
-                      f"guard tripped)  {controller.state()}", flush=True)
-            continue
+        # loss.item() forces a host<->device sync every micro-step - real, measurable cost at
+        # this scale (llm.c-class throughput work flags exactly this pattern) and unnecessary
+        # for every arm the project currently runs, none of which use a controller. Controller
+        # arms (pooled/pooled2/hybrid/routed2/routed3/routed4 - all retired, none of the final
+        # four) still need the per-step float for should_skip/observe's spike-guard logic, so
+        # they keep the old unconditional sync; everything else defers the sync to the
+        # LOG_EVERY block below (running accumulates the raw GPU tensor in the meantime).
+        if controller is not None:
+            loss_val = loss.item()
+            controller_loss_val = float(controller_loss) if arm in ("pooled", "pooled2", "hybrid", "routed2", "routed3", "routed4") else loss_val
+            if controller.should_skip(loss_val):
+                opt.zero_grad()
+                if step % LOG_EVERY == 0:
+                    print(f"step {step}/{total_steps}  SKIPPED (loss={loss_val:.3f}, "
+                          f"guard tripped)  {controller.state()}", flush=True)
+                continue
 
         # DDP all-reduces gradients on every .backward() by default - correct but wasteful
         # during grad-accumulation micro-steps, since only the LAST one before opt.step()
@@ -1210,7 +1232,7 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
                       f"every trainable tensor)", flush=True)
             opt.zero_grad()
             continue
-        running += loss_val
+        running += loss.detach()  # no .item() here - see the sync-avoidance comment above
         running_n += 1
         if is_sync_step:
             opt.step()
@@ -1228,14 +1250,14 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
             print(f"  >>> held-out val CE @ step {step}: {val_ce:.4f} (over {VAL_BATCHES} val batches)", flush=True)
 
         if is_main and step % LOG_EVERY == 0:
-            avg = running / max(running_n, 1)
+            avg = (running / max(running_n, 1)).item()  # the one sync per LOG_EVERY steps, not per micro-step
             entry = {"step": step, "loss": round(avg, 4), "elapsed": round(time.time() - t0)}
             if controller is not None:
                 entry.update(controller.state())
             history.append(entry)
             ctl = f"  {controller.state()}" if controller is not None else ""
             print(f"step {step}/{total_steps}  loss={avg:.4f}  elapsed={time.time()-t0:.0f}s{ctl}", flush=True)
-            running, running_n = 0.0, 0
+            running, running_n = torch.zeros((), device=device), 0
 
         if is_main and (step % CHECKPOINT_EVERY == 0 or step == total_steps):
             # raw_model, not model - model.state_dict() on a DDP-wrapped module prefixes every
