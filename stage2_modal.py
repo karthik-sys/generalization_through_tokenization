@@ -638,6 +638,7 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     from torch.utils.data import DataLoader, IterableDataset
 
     from src.data.build_examples import TokenizerBundle
+    from src.model.backbone_modern import ModernBackbone
     from src.model.baseline_model import BaselineModel
     from src.model.mot_hybrid_model import MoTHybridModel
     from src.model.mot_model import MoTModel
@@ -648,9 +649,11 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
     from src.model.mot_routed_deepexpert_model import MoTRoutedDeepExpertModel
     from src.model.mot_routed_model import MoTRoutedModel
     from src.model.mot_routed_precision_model import MoTRoutedPrecisionModel
+    from src.model.mot_routed_tied_model import MoTRoutedTiedModel
     from src.model.stage2_config import (
         BACKBONE_ONLY_CFG, BATCH_SIZE, CONFIDENCE_WEIGHT, FOCAL_GAMMA, LARGE_BACKBONE_ONLY_CFG,
-        LARGE_MODEL_CFG, LONGCTX_MODEL_CFG, MODEL_CFG, STREAM_SOURCES,
+        LARGE_MODEL_CFG, LONGCTX_MODEL_CFG, MODEL_CFG, ROUTED30_MODEL_CFG, ROUTED_MODERN_MODEL_CFG,
+        STREAM_SOURCES, TIED_MODEL_CFG,
     )
 
     device = "cuda"
@@ -688,6 +691,19 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
         # - held-out eval must match, or this scores it against a distribution it never saw.
         STREAM_SOURCES["nlp"] = {"path": "deepmind/pg19", "name": None, "gated": False}
     elif arm in ("routed20", "routed21", "routed22", "routed23", "routed24", "routed25", "routed26"):
+        STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
+    elif arm == "routed29":
+        MODEL_CFG = TIED_MODEL_CFG  # bridge-tied heads, 23 layers, from scratch
+        STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
+    elif arm == "routed30":
+        MODEL_CFG = ROUTED30_MODEL_CFG  # direct-tied (wide emb_dim=512), shrunk vocab, from scratch
+        STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
+    elif arm in ("routed31", "routed32"):
+        MODEL_CFG = ROUTED_MODERN_MODEL_CFG  # RoPE/RMSNorm(+SwiGLU/QK-norm for routed31 only)
+        STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
+    elif arm == "routed33":
+        MODEL_CFG = LARGE_MODEL_CFG  # 5-domain generalist, large scale, from scratch
+        scale = "large"
         STREAM_SOURCES["nlp"] = {"path": "Skylion007/openwebtext", "name": None, "gated": False}
     elif scale == "large":
         MODEL_CFG = LARGE_MODEL_CFG
@@ -867,13 +883,16 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
                         buf = buf[self.seq_len + 1:]
 
     bundle = TokenizerBundle(
-        tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
-        nlp_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp"
+        tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_shrunk" if arm == "routed30" else f"{VOLUME_PATH}/tokenizers_stage2"),
+        nlp_tokenizer_dir=(None if arm == "routed30" else
+                            (f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp"
                             if arm in ("routed7", "routed8", "routed11", "routed12", "routed13", "routed14",
                                         "routed15", "routed16", "routed17", "routed18", "routed19",
                                         "routed20", "routed21", "routed22", "routed23", "routed24",
-                                        "routed25", "routed26", "routed27", "routed28") else
-                            (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None)),
+                                        "routed25", "routed26", "routed27", "routed28", "routed29",
+                                        "routed31", "routed32", "routed33") else
+                            (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None))),
+        generalist_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_generalist/generalist" if arm == "routed33" else None),
     )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
@@ -882,15 +901,26 @@ def evaluate(arm: str = "mot", checkpoint_step: int = 20000, eval_batches: int =
                              "routed7", "routed8", "routed9", "routed10", "routed11", "routed12", "routed13", "routed14",
                              "routed15", "routed16", "routed17", "routed18", "routed19",
                              "routed20", "routed21", "routed22", "routed23", "routed24",
-                             "routed25", "routed26", "routed27", "routed28")
+                             "routed25", "routed26", "routed27", "routed28",
+                             "routed29", "routed30", "routed31", "routed32", "routed33")
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed", "routed7", "routed8", "routed9", "routed10", "routed15", "routed17", "routed18",
                  "routed19", "routed23"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed11", "routed14", "routed16", "routed20", "routed21", "routed22", "routed24",
-                 "routed25", "routed26", "routed27", "routed28"):
+                 "routed25", "routed26", "routed27", "routed28", "routed33"):
         model = MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm in ("routed29", "routed30"):
+        model = MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "routed31":
+        model = MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
+                                    backbone_cls=ModernBackbone,
+                                    backbone_kwargs={"use_swiglu": True, "use_qk_norm": True}).to(device)
+    elif arm == "routed32":
+        model = MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
+                                    backbone_cls=ModernBackbone,
+                                    backbone_kwargs={"use_swiglu": False, "use_qk_norm": False}).to(device)
     elif arm == "routed12":
         model = MoTRoutedDeepExpertModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "routed13":
@@ -1105,6 +1135,7 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     from datasets import load_dataset
 
     from src.data.build_examples import TokenizerBundle
+    from src.model.backbone_modern import ModernBackbone
     from src.model.baseline_model import BaselineModel
     from src.model.mot_hybrid_model import MoTHybridModel
     from src.model.mot_model import MoTModel
@@ -1115,9 +1146,10 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
     from src.model.mot_routed_deepexpert_model import MoTRoutedDeepExpertModel
     from src.model.mot_routed_model import MoTRoutedModel
     from src.model.mot_routed_precision_model import MoTRoutedPrecisionModel
+    from src.model.mot_routed_tied_model import MoTRoutedTiedModel
     from src.model.stage2_config import (
         BACKBONE_ONLY_CFG, CONFIDENCE_WEIGHT, FOCAL_GAMMA, LARGE_BACKBONE_ONLY_CFG, LARGE_MODEL_CFG,
-        LONGCTX_MODEL_CFG, MODEL_CFG,
+        LONGCTX_MODEL_CFG, MODEL_CFG, ROUTED30_MODEL_CFG, ROUTED_MODERN_MODEL_CFG, TIED_MODEL_CFG,
     )
 
     device = "cuda"
@@ -1141,19 +1173,31 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
         scale = "large"
     elif arm == "routed9":
         pass  # routed9 stays BASE scale - only the nlp tokenizer dir below differs
+    elif arm == "routed29":
+        MODEL_CFG = TIED_MODEL_CFG
+    elif arm == "routed30":
+        MODEL_CFG = ROUTED30_MODEL_CFG
+    elif arm in ("routed31", "routed32"):
+        MODEL_CFG = ROUTED_MODERN_MODEL_CFG
+    elif arm == "routed33":
+        MODEL_CFG = LARGE_MODEL_CFG
+        scale = "large"
     elif scale == "large":
         MODEL_CFG = LARGE_MODEL_CFG
     BACKBONE_ONLY_CFG = LARGE_BACKBONE_ONLY_CFG if scale == "large" else BACKBONE_ONLY_CFG
     ckpt_prefix = f"large_{arm}" if scale == "large" else arm
     seq_len = MODEL_CFG["max_seq_len"]
     bundle = TokenizerBundle(
-        tokenizer_dir=f"{VOLUME_PATH}/tokenizers_stage2",
-        nlp_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp"
+        tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_shrunk" if arm == "routed30" else f"{VOLUME_PATH}/tokenizers_stage2"),
+        nlp_tokenizer_dir=(None if arm == "routed30" else
+                            (f"{VOLUME_PATH}/tokenizers_stage2_owt/nlp"
                             if arm in ("routed7", "routed8", "routed11", "routed12", "routed13", "routed14",
                                         "routed15", "routed16", "routed17", "routed18", "routed19",
                                         "routed20", "routed21", "routed22", "routed23", "routed24",
-                                        "routed25", "routed26", "routed27", "routed28") else
-                            (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None)),
+                                        "routed25", "routed26", "routed27", "routed28", "routed29",
+                                        "routed31", "routed32", "routed33") else
+                            (f"{VOLUME_PATH}/tokenizers_stage2_books/nlp" if arm in ("routed9", "routed10") else None))),
+        generalist_tokenizer_dir=(f"{VOLUME_PATH}/tokenizers_stage2_generalist/generalist" if arm == "routed33" else None),
     )
     ckpt = torch.load(f"{VOLUME_PATH}/checkpoints/{ckpt_prefix}_step{checkpoint_step}.pt", map_location=device)
 
@@ -1162,15 +1206,26 @@ def evaluate_lambada(arm: str = "mot", checkpoint_step: int = 150000, n_examples
                              "routed7", "routed8", "routed9", "routed10", "routed11", "routed12", "routed13", "routed14",
                              "routed15", "routed16", "routed17", "routed18", "routed19",
                              "routed20", "routed21", "routed22", "routed23", "routed24",
-                             "routed25", "routed26", "routed27", "routed28")
+                             "routed25", "routed26", "routed27", "routed28",
+                             "routed29", "routed30", "routed31", "routed32", "routed33")
     if arm == "mot":
         model = MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed", "routed7", "routed8", "routed9", "routed10", "routed15", "routed17", "routed18",
                  "routed19", "routed23"):
         model = MoTRoutedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm in ("routed11", "routed14", "routed16", "routed20", "routed21", "routed22", "routed24",
-                 "routed25", "routed26", "routed27", "routed28"):
+                 "routed25", "routed26", "routed27", "routed28", "routed33"):
         model = MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm in ("routed29", "routed30"):
+        model = MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
+    elif arm == "routed31":
+        model = MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
+                                    backbone_cls=ModernBackbone,
+                                    backbone_kwargs={"use_swiglu": True, "use_qk_norm": True}).to(device)
+    elif arm == "routed32":
+        model = MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG,
+                                    backbone_cls=ModernBackbone,
+                                    backbone_kwargs={"use_swiglu": False, "use_qk_norm": False}).to(device)
     elif arm == "routed12":
         model = MoTRoutedDeepExpertModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     elif arm == "routed13":
