@@ -2050,7 +2050,7 @@ def main(step: str = "calibrate", arm: str = "mot", steps: int = 0, resume_from:
         print(f"{sec_per_step:.3f} sec/step x {MAX_STEPS} steps = {sec_per_step*MAX_STEPS/3600:.2f} GPU-hours")
         print(f"at ~$0.59/hr (T4): ~${sec_per_step*MAX_STEPS/3600*0.59:.2f} for this arm")
     elif step == "evaluate":
-        result = evaluate.remote(arm=arm, checkpoint_step=steps or 20000, noisy=noisy, scale=scale)
+        result = evaluate.remote(arm=arm, checkpoint_step=steps or 20000, eval_batches=n_examples if n_examples != 500 else 200, noisy=noisy, scale=scale)
         mode = "noisy" if noisy else "clean"
         print(f"\nheld-out single-domain BPB for {arm} ({mode}): {result['single_domain_bpb']:.4f} bits/byte")
         if result["cross_domain_bpb"] is not None:
