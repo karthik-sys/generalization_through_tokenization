@@ -64,8 +64,8 @@ from src.model.stage2_config import (
 BET_ARMS = ("routed11", "routed12", "routed13", "routed14", "routed15", "routed16")
 # copy-gate, deep-experts, precision-head, scaled-up copy-gate, control, copy-gate-v2-frozen -
 # all use bare PackedRoutedStream + the NEW_MODULE_MATCH-driven differential-LR path.
-LARGE_BET_ARMS = ("routed14", "routed28", "routed33", "routed35")  # subset that forces scale="large" (see _build_model)
-FAST_SETTINGS_ARMS = ("nlpbranch",)  # micro-batch 32/accum 2 (FAST_BATCH_SIZE/FAST_GRAD_ACCUM_STEPS)
+LARGE_BET_ARMS = ("routed14", "routed28", "routed33")  # subset that forces scale="large" (see _build_model)
+FAST_SETTINGS_ARMS = ("nlpbranch", "routed35", "routed34", "routed36", "routed37")  # micro-batch 32/accum 2 (FAST_BATCH_SIZE/FAST_GRAD_ACCUM_STEPS)
 # instead of the global BATCH_SIZE(4)/GRAD_ACCUM_STEPS(16) - same effective batch (64), same
 # precedent/reasoning as routed19's own override (see ROUTED19_BATCH_SIZE's comment in
 # stage2_config.py). Extend this tuple as routed34/36/37 get built.
@@ -226,7 +226,9 @@ def _apply_openwebtext_nlp_source() -> None:
 
 
 def _apply_generalist_domain_source() -> None:
-    """arms routed33/routed35: registers "generalist" as a 5th domain in STREAM_SOURCES so
+    """arm routed33 only (routed35 was redesigned away from the generalist-domain merge idea -
+    see git history if that's ever revisited): registers "generalist" as a 5th domain in
+    STREAM_SOURCES so
     synthetic_multidomain_doc_stream's `domains = list(STREAM_SOURCES)` includes it in the
     per-doc domain pool - without this, PackedRoutedStream's domain_index would list
     "generalist" (from the bundle) but the doc-generation step would never actually EMIT any
@@ -374,12 +376,12 @@ def _warm_start_routed33_generalist(model, parent_ckpt_prefix: str, device: str,
     the 5th control row, and generalist's own embedding/projection/head, which aren't in the
     parent checkpoint at all) at fresh init.
 
-    exact_step (routed35): pins a SPECIFIC parent checkpoint instead of _latest_parent_
-    checkpoint's always-pick-the-newest default. routed35 warm-starts from routed28@140000
-    deliberately (its best-balance checkpoint per the audit - single BPB 1.5839, math/science
-    still healthy) rather than routed28's final 300k (single BPB eroded to 1.8011, math ppl
-    298->919) - picking "latest" here would silently inherit the erosion this arm exists to
-    avoid propagating forward."""
+    exact_step: pins a SPECIFIC parent checkpoint instead of _latest_parent_checkpoint's
+    always-pick-the-newest default - for a parent recipe known to erode late in training
+    (e.g. routed28: single BPB 1.5839 @140k, best-balance, vs 1.8011 eroded @300k final),
+    where picking "latest" would silently inherit that erosion into whatever warm-starts from
+    it. Currently unused (routed35 was redesigned to train from scratch instead - see git
+    history), kept here since the mechanism is real and may be wanted again."""
     if exact_step is not None:
         candidate = CKPT_DIR / f"{parent_ckpt_prefix}_step{exact_step}.pt"
         latest = str(candidate) if candidate.exists() else None
@@ -457,16 +459,8 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
             # generalist_tokenizer_dir set), so every head/control_embedding is sized for 5
             # domains from the start - no resize needed since there's no parent to resize from.
             return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LARGE_MODEL_CFG).to(device)
-        if arm == "routed35":  # routed33's generalist-domain recipe merged onto routed28's
-            # already-good backbone instead of from scratch - the exact follow-up routed33 was
-            # built to de-risk. Same 5-domain shape as routed33 (generalist_tokenizer_dir set
-            # below), same model class - the warm-start (see _warm_start_routed33_generalist,
-            # called with exact_step=140000 in train()) is what differs, done via surgical
-            # resize since routed28's checkpoint only has 4 domains' worth of head/control_
-            # embedding width.
-            return MoTRoutedCopyGateModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **LARGE_MODEL_CFG).to(device)
         raise ValueError(
-            f"scale=large supports mot/baseline/routed/routed3/routed7/routed10/routed14/routed28/routed33/routed35, not {arm}")
+            f"scale=large supports mot/baseline/routed/routed3/routed7/routed10/routed14/routed28/routed33, not {arm}")
     if arm == "mot":
         return MoTModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **MODEL_CFG).to(device)
     if arm in ("routed", "routed8", "routed9", "routed15", "routed17", "routed18", "routed19", "routed23"):
@@ -523,6 +517,16 @@ def _build_model(arm: str, bundle: TokenizerBundle, device: str, scale: str = "b
         # routed29's allocation + only RoPE + RMSNorm (no SwiGLU/QK-norm) - the "safe
         # improver", the two changes closest to risk-free, meant to actually beat the
         # flagship rather than test a hypothesis.
+        from src.model.stage2_config import ROUTED_MODERN_MODEL_CFG
+        return MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **ROUTED_MODERN_MODEL_CFG,
+                                   backbone_cls=ModernBackbone,
+                                   backbone_kwargs={"use_swiglu": False, "use_qk_norm": False}).to(device)
+    if arm == "routed35":
+        # Redesigned per the session's own final-four re-plan (superseding the earlier
+        # generalist-merge version of this arm name - see git history if that's ever needed
+        # again). Now the SAFE control of the ladder: D's exact class/config/data, FROM
+        # SCRATCH, just run to 9.8B tokens (8x D's own 1.2B) instead of continuing D. Isolates
+        # what tokens alone buy, independent of the data-quality change routed34 also makes.
         from src.model.stage2_config import ROUTED_MODERN_MODEL_CFG
         return MoTRoutedTiedModel(domain_vocab_sizes=bundle.domain_vocab_sizes, **ROUTED_MODERN_MODEL_CFG,
                                    backbone_cls=ModernBackbone,
@@ -597,14 +601,14 @@ def calibrate(arm: str, steps: int, scale: str = "base") -> float:
         # warm-start-compatible with routed17's embedding tables. _apply_books_nlp_source is a
         # pure STREAM_SOURCES mutation, independent of tokenizer choice - see its docstring.
         _apply_books_nlp_source()
-    if arm in ("routed33", "routed35"):
+    if arm == "routed33":
         _apply_generalist_domain_source()
 
     nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in OWT_TOKENIZER_ARMS else \
         (BOOKS_NLP_TOKENIZER_DIR if arm in ("routed9", "routed10") else None)
     tok_dir = SHRUNK_TOKENIZER_DIR if arm == "routed30" else TOKENIZER_DIR
     bundle = TokenizerBundle(tokenizer_dir=tok_dir, nlp_tokenizer_dir=None if arm == "routed30" else nlp_tok_dir,
-                              generalist_tokenizer_dir=GENERALIST_TOKENIZER_DIR if arm in ("routed33", "routed35") else None)
+                              generalist_tokenizer_dir=GENERALIST_TOKENIZER_DIR if arm == "routed33" else None)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     model = _build_model(arm, bundle, device, scale)
     if is_main:
@@ -824,14 +828,14 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         # warm-start-compatible with routed17's embedding tables. _apply_books_nlp_source is a
         # pure STREAM_SOURCES mutation, independent of tokenizer choice - see its docstring.
         _apply_books_nlp_source()
-    if arm in ("routed33", "routed35"):
+    if arm == "routed33":
         _apply_generalist_domain_source()
 
     nlp_tok_dir = OWT_NLP_TOKENIZER_DIR if arm in OWT_TOKENIZER_ARMS else \
         (BOOKS_NLP_TOKENIZER_DIR if arm in ("routed9", "routed10") else None)
     tok_dir = SHRUNK_TOKENIZER_DIR if arm == "routed30" else TOKENIZER_DIR
     bundle = TokenizerBundle(tokenizer_dir=tok_dir, nlp_tokenizer_dir=None if arm == "routed30" else nlp_tok_dir,
-                              generalist_tokenizer_dir=GENERALIST_TOKENIZER_DIR if arm in ("routed33", "routed35") else None)
+                              generalist_tokenizer_dir=GENERALIST_TOKENIZER_DIR if arm == "routed33" else None)
     domain_index = {d: i for i, d in enumerate(bundle.domain_vocab_sizes)}
     model = _build_model(arm, bundle, device, scale)
     if is_main:
@@ -933,14 +937,6 @@ def train(arm: str, max_steps: int | None = None, scale: str = "base") -> list:
         if arm == "routed12":
             warm_started = _warm_start_deep_expert(
                 model, WARM_START_PARENT[arm], device, n_shared=MODEL_CFG["n_layers"] - DEFAULT_N_EXPERT_LAYERS)
-        elif arm == "routed35":
-            # pinned to routed28's step-140000 checkpoint specifically, not "latest" - see
-            # _warm_start_routed33_generalist's exact_step docstring for why. Prefix is
-            # "large_routed28" (not "routed28") since routed28 is a scale="large" arm and
-            # saves checkpoints under that prefix - see ckpt_prefix's construction above and
-            # WARM_START_PARENT's own "large_routed14"/"large_routed7" entries for the same
-            # convention on every other large-scale parent.
-            warm_started = _warm_start_routed33_generalist(model, "large_routed28", device, exact_step=140000)
         elif arm == "nlpbranch":
             # routed32 ("D") is base scale, not scale="large" (unlike routed28/33/35), so its
             # checkpoint prefix is plain "routed32" - no "large_" prefix to account for here.
